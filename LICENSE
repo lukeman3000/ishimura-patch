@@ -1,0 +1,41 @@
+Ishimura Patch
+Copyright (c) 2026 lukeman3000
+
+Permission is granted, free of charge, to anyone who obtains Ishimura Patch
+or its source code, under the following terms.
+
+YOU MAY
+  - Use Ishimura Patch to play the game.
+  - Read the source code, build it, and modify it.
+
+YOU MAY SHARE YOUR OWN MODIFIED VERSION (A "FORK"), ON THESE CONDITIONS
+  1. It has a name of its own. The name "Ishimura Patch" stays with the
+     original; your version must not use it as its name or present itself
+     as Ishimura Patch or as an official version of it.
+  2. Its download page, or its readme if it has no page, states clearly and
+     visibly that it is based on Ishimura Patch by lukeman3000, with a link
+     to https://github.com/lukeman3000/ishimura-patch.
+  3. It includes this license, unchanged.
+
+YOU MAY NOT, WITHOUT THE AUTHOR'S WRITTEN PERMISSION
+  - Re-upload or redistribute Ishimura Patch itself, unmodified or with only
+    trivial changes (such as renaming files or changing default settings),
+    on Nexus Mods, mirrors, modpacks, collections, installers or anywhere
+    else. Link to an official source instead.
+  - Use Ishimura Patch, or any part of it, commercially.
+
+Official sources: https://github.com/lukeman3000/ishimura-patch and the
+author's own pages, such as https://ishimurapatch.com.
+
+To ask for permission, contact lukeman3000 through the Ishimura Patch
+Discord: https://discord.gg/sNkn7rF5XV
+
+Third-party code in third_party/ keeps its own license (MinHook: see
+third_party/minhook/LICENSE.txt).
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
