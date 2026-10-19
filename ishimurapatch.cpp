@@ -103,7 +103,7 @@ struct Config
     int  dataReadMBs = 0;
     int  maxFps = 0;
     int  raiseDirectQueue = 0;
-    int  raiseCopyQueue = 0;
+    int  raiseCopyQueue = 1;
     struct { char cls[96], fld[96], val[64]; } engine[16];   // [Engine] Class.Field = value
     int  nEngine = 0;
 };
@@ -142,6 +142,13 @@ static const char* DEFAULT_INI =
 "; Press this key while playing to switch Suballocate on or off (logged),\n"
 "; for comparing the two in one session. F1-F12 or a letter; empty = off.\n"
 "ToggleKey = F9\n"
+"\n"
+"; (read at launch) At a streaming boundary the game's copy queue uploads\n"
+"; the new area's data while the graphics queue waits for those uploads.\n"
+"; This creates the copy queue at high priority so they finish sooner.\n"
+"; (Lift test: about 25% fewer uneven frames.)\n"
+"; 1 = on (default), 0 = the game's normal priority\n"
+"RaiseCopyQueue = 1\n"
 "\n"
 "; (read at launch) The large blocks in graphics memory: their size (MB,\n"
 "; 16-256), how many are made when the game starts (0-16; more are added\n"
@@ -246,12 +253,6 @@ static const char* DEFAULT_INI =
 "; 0 = off (default), 1 = on\n"
 "RaiseDirectQueue = 0\n"
 "\n"
-"; DEVELOPMENT (read at launch). Create the game's copy queue at high\n"
-"; priority. At a streaming boundary it uploads the new area's data while\n"
-"; the graphics queue waits on those uploads, so finishing them sooner may\n"
-"; mean less waiting. An experiment. 0 = off (default), 1 = on\n"
-"RaiseCopyQueue = 0\n"
-"\n"
 "; DEVELOPMENT (read at launch). Runs ishimurapatch_probe.dll (beside this\n"
 "; file) once each time it changes, from 20 seconds after the game starts:\n"
 "; reverse-engineering code that is rebuilt while the game runs. Without\n"
@@ -303,7 +304,7 @@ static void ReadConfig(Config& c, const Config& fb)
     GetPrivateProfileStringA("Advanced", "CaptureKey", fb.captureKey, c.captureKey, sizeof(c.captureKey), ini);
     c.probe   = GetPrivateProfileIntA("Advanced", "Probe", fb.probe, ini) ? 1 : 0;
     c.raiseDirectQueue = GetPrivateProfileIntA("Advanced", "RaiseDirectQueue", fb.raiseDirectQueue, ini) ? 1 : 0;
-    c.raiseCopyQueue   = GetPrivateProfileIntA("Advanced", "RaiseCopyQueue", fb.raiseCopyQueue, ini) ? 1 : 0;
+    c.raiseCopyQueue   = GetPrivateProfileIntA("Fix", "RaiseCopyQueue", fb.raiseCopyQueue, ini) ? 1 : 0;
 
     if (c.logging < 0 || c.logging > 2) c.logging = fb.logging;
     if (c.hitchMs < 1) c.hitchMs = fb.hitchMs;
@@ -1940,7 +1941,7 @@ static void NoteQueue(const D3D12_COMMAND_QUEUE_DESC* d, void* q)
     HookQueueMethods(q);
 }
 
-// [Advanced] RaiseDirectQueue / RaiseCopyQueue = 1 create the game's DIRECT
+// [Advanced] RaiseDirectQueue / [Fix] RaiseCopyQueue = 1 create the game's DIRECT
 // (graphics) / COPY queues at HIGH priority (experiments; priority is fixed
 // when a queue is created). The QUEUES lines at the lift (10/19): at the
 // boundary the copy queue goes from 0 to 60-160 submissions a second and the
