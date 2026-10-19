@@ -1,9 +1,11 @@
 // ============================================================================
 //  Ishimura Patch  (ishimurapatch.asi)  -  Dead Space (2023)
 // ----------------------------------------------------------------------------
-//  0.1.0 is a measurement build: it changes nothing the game does. It times
-//  the game's D3D12 GPU memory requests and the residency waits inside them,
-//  and logs the frames they slow down.
+//  It times the game's D3D12 GPU memory requests and the residency waits
+//  inside them, and logs the frames they slow down. 0.2.0 adds the first fix,
+//  SUBALLOCATION (off by default, F9 switches it live): the game's small
+//  committed resources are created as placed resources inside a few large
+//  pre-made heaps instead.
 //
 //  Why: at streaming boundaries (the lift test spot) the game creates
 //  hundreds of small GPU resources in one frame. D3D12 makes each one
@@ -22,6 +24,17 @@
 //     through a throwaway 8x8 swap chain on a hidden window.
 //   - D3DKMTWaitForSynchronizationObjectFromCpu (MinHook), the kernel wait
 //     the residency fence goes through.
+//
+//  Suballocation: in-game (0.1.1, lift pass) the worst frame was 98.8 ms,
+//  447 committed creates at ~0.2 ms each (60% of it the residency wait) on
+//  one job thread, next to 438 placed creates at ~0.01 ms each. Over a
+//  session the game made 20,622 committed creates (6.8 s of thread time),
+//  nearly all DEFAULT-heap, CREATE_NOT_ZEROED, flags 0 or UAV, <= 4 MB. Only
+//  that shape is redirected: NOT_ZEROED means reused memory is acceptable,
+//  and no render targets or depth buffers means no placed-resource
+//  initialization rules apply. A resource's pages go back to the pool when
+//  D3D12 destroys it (a tracker set with SetPrivateDataInterface is released
+//  then). Anything that fails falls back to the committed path.
 //
 //  Logging (ishimurapatch.ini): 1 = what was hooked, a HITCH line per slow
 //  frame, a STATS line every 30 s. 2 = also every request and every frame,
@@ -44,7 +57,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "version.lib")
 
-static const char* MOD_VERSION = "0.1.2";
+static const char* MOD_VERSION = "0.2.0";
 
 extern "C" {
 extern const int VT_GetResourceAllocationInfo, VT_CreateCommittedResource, VT_CreateHeap,
@@ -71,6 +84,11 @@ struct Config
     int  logging = 1;
     int  hitchMs = 20;
     char captureKey[32] = "F8";
+    int  suballocate = 0;
+    char toggleKey[32] = "F9";
+    int  blockMB = 64;
+    int  prewarmBlocks = 4;
+    int  maxResourceKB = 4096;
 };
 static Config g_cfg;
 
@@ -100,7 +118,29 @@ static const char* DEFAULT_INI =
 "; ishimurapatch_capture_<date>_<time>.log, which a relaunch does not\n"
 "; overwrite. Works at Logging = 2 only; inert at the others. F1-F12 or a\n"
 "; letter; empty = off.\n"
-"CaptureKey = F8\n";
+"CaptureKey = F8\n"
+"\n"
+"[Fix]\n"
+"; EXPERIMENTAL. The stutter at streaming boundaries comes from the game\n"
+"; asking Windows for hundreds of small GPU memory blocks in one frame,\n"
+"; each one a slow round trip. With this on, those small textures and\n"
+"; buffers are carved out of a few large blocks made in advance instead.\n"
+";  0 = off (the game as shipped, default)\n"
+";  1 = on\n"
+"Suballocate = 0\n"
+"\n"
+"; Press this key while playing to switch Suballocate on or off (logged),\n"
+"; for comparing the two in one session. It applies to resources created\n"
+"; from then on. F1-F12 or a letter; empty = off.\n"
+"ToggleKey = F9\n"
+"\n"
+"; Size of each large block (MB, 16-256), how many are made when the game\n"
+"; starts (0-16; more are added as needed), and the largest single\n"
+"; resource carved out of them (KB, 64-16384). Larger ones stay as the\n"
+"; game made them.\n"
+"BlockMB = 64\n"
+"PrewarmBlocks = 4\n"
+"MaxResourceKB = 4096\n";
 
 static void LoadConfig()
 {
@@ -127,8 +167,18 @@ static void LoadConfig()
     g_cfg.hitchMs = GetPrivateProfileIntA("Logging", "HitchMs", fb.hitchMs, g_files.iniPath);
     GetPrivateProfileStringA("Logging", "CaptureKey", fb.captureKey, g_cfg.captureKey,
                              sizeof(g_cfg.captureKey), g_files.iniPath);
+    g_cfg.suballocate   = GetPrivateProfileIntA("Fix", "Suballocate", fb.suballocate, g_files.iniPath);
+    GetPrivateProfileStringA("Fix", "ToggleKey", fb.toggleKey, g_cfg.toggleKey, sizeof(g_cfg.toggleKey), g_files.iniPath);
+    g_cfg.blockMB       = GetPrivateProfileIntA("Fix", "BlockMB", fb.blockMB, g_files.iniPath);
+    g_cfg.prewarmBlocks = GetPrivateProfileIntA("Fix", "PrewarmBlocks", fb.prewarmBlocks, g_files.iniPath);
+    g_cfg.maxResourceKB = GetPrivateProfileIntA("Fix", "MaxResourceKB", fb.maxResourceKB, g_files.iniPath);
     if (g_cfg.logging < 0 || g_cfg.logging > 2) g_cfg.logging = 1;
     if (g_cfg.hitchMs < 1) g_cfg.hitchMs = fb.hitchMs;
+    g_cfg.suballocate = g_cfg.suballocate ? 1 : 0;
+    if (g_cfg.blockMB < 16 || g_cfg.blockMB > 256) g_cfg.blockMB = fb.blockMB;
+    if (g_cfg.prewarmBlocks < 0 || g_cfg.prewarmBlocks > 16) g_cfg.prewarmBlocks = fb.prewarmBlocks;
+    if (g_cfg.maxResourceKB < 64 || g_cfg.maxResourceKB > 16384) g_cfg.maxResourceKB = fb.maxResourceKB;
+    if (g_cfg.maxResourceKB > g_cfg.blockMB * 1024) g_cfg.maxResourceKB = g_cfg.blockMB * 1024;
 }
 
 // ----------------------------------------------------------------------------
@@ -253,20 +303,28 @@ enum Kind : unsigned short
 {
     K_COMMITTED, K_COMMITTED1, K_COMMITTED2, K_COMMITTED3, K_HEAP, K_HEAP1,
     K_PLACED, K_PLACED1, K_PLACED2, K_RESERVED, K_RESERVED1, K_RESERVED2,
-    K_MAKERESIDENT, K_EVICT, K_ENQUEUE, K_FRAME, K_COUNT
+    K_MAKERESIDENT, K_EVICT, K_ENQUEUE, K_FRAME,
+    K_SUB, K_SUB1, K_SUB2, K_SUB3,   // a committed request made placed by the fix
+    K_COUNT
 };
 static const char* KIND_NAME[K_COUNT] = {
     "committed", "committed1", "committed2", "committed3", "heap", "heap1",
     "placed", "placed1", "placed2", "reserved", "reserved1", "reserved2",
-    "MakeResident", "Evict", "EnqueueMakeResident", "FRAME" };
-enum Cat { C_COMMITTED, C_HEAP, C_PLACED, C_RESERVED, C_RESIDENCY, C_COUNT };
+    "MakeResident", "Evict", "EnqueueMakeResident", "FRAME",
+    "sub", "sub1", "sub2", "sub3" };
+enum Cat { C_COMMITTED, C_HEAP, C_PLACED, C_RESERVED, C_RESIDENCY, C_SUB, C_FRAME, C_COUNT };
 static Cat CatOf(Kind k)
 {
-    if (k <= K_COMMITTED3) return C_COMMITTED;
-    if (k <= K_HEAP1) return C_HEAP;
-    if (k <= K_PLACED2) return C_PLACED;
-    if (k <= K_RESERVED2) return C_RESERVED;
-    return C_RESIDENCY;
+    switch (k)
+    {
+    case K_COMMITTED: case K_COMMITTED1: case K_COMMITTED2: case K_COMMITTED3: return C_COMMITTED;
+    case K_HEAP: case K_HEAP1:                                                 return C_HEAP;
+    case K_PLACED: case K_PLACED1: case K_PLACED2:                             return C_PLACED;
+    case K_RESERVED: case K_RESERVED1: case K_RESERVED2:                       return C_RESERVED;
+    case K_SUB: case K_SUB1: case K_SUB2: case K_SUB3:                         return C_SUB;
+    case K_FRAME:                                                              return C_FRAME;
+    default:                                                                   return C_RESIDENCY;
+    }
 }
 
 struct FrameAcc
@@ -339,7 +397,7 @@ static void Finish(const CallScope& s, Kind k, HRESULT hr, UINT64 bytes,
     InterlockedIncrement(&g_frame.count[c]);
     InterlockedAdd64(&g_frame.createTicks, dur);
     InterlockedAdd64(&g_frame.waitTicks, wait);
-    if (SUCCEEDED(hr) && c != C_PLACED && c != C_RESERVED && c != C_RESIDENCY)
+    if (SUCCEEDED(hr) && (c == C_COMMITTED || c == C_HEAP || c == C_SUB))
         InterlockedAdd64(&g_frame.bytes, (LONG64)bytes);
     ThreadSlot& ts = g_slots[s.slot];
     InterlockedAdd64(&ts.createTicks, dur);
@@ -404,11 +462,232 @@ static PFN_CRR  o_CRR;  static PFN_CRR1 o_CRR1; static PFN_CRR2 o_CRR2;
 static PFN_RES  o_MakeResident, o_Evict;
 static PFN_ENQ  o_Enqueue;
 
+// ----------------------------------------------------------------------------
+// Suballocation: 64 KB pages in large DEFAULT heaps, one bitmap per heap,
+// first fit. Heaps are never released (the pool only grows). Every call
+// that reaches the pool holds one SRW lock; a new heap is made under it.
+// ----------------------------------------------------------------------------
+static const UINT64 SUB_PAGE = 65536;
+struct SubBlock
+{
+    ID3D12Heap* heap;
+    UINT64*     bits;        // 1 = page in use
+    UINT        pages, freePages;
+};
+static const int SUB_MAX_BLOCKS = 256;
+struct SubState
+{
+    SRWLOCK        lock = SRWLOCK_INIT;
+    SubBlock*      blocks[SUB_MAX_BLOCKS] = {};
+    int            count = 0;
+    volatile LONG  on = 0;
+    ID3D12Device*  dev = NULL;
+    bool           tierOk = false;
+    volatile LONG  live = 0, made = 0, fellBack = 0, heapFails = 0;
+    volatile LONG64 usedPages = 0;
+};
+static SubState g_sub;
+
+// {7B3E6A51-2C4D-4F88-9A1E-5D2B8C0F4E17}: our tracker's private-data key
+static const GUID SUB_TRACKER_GUID = { 0x7b3e6a51, 0x2c4d, 0x4f88, { 0x9a, 0x1e, 0x5d, 0x2b, 0x8c, 0x0f, 0x4e, 0x17 } };
+
+struct SubSlot { SubBlock* block; UINT first, pages; };
+
+static SubBlock* SubNewBlock()   // under the lock
+{
+    if (g_sub.count >= SUB_MAX_BLOCKS || !o_CH || !g_sub.dev) return NULL;
+    D3D12_HEAP_DESC hd = {};
+    hd.SizeInBytes = (UINT64)g_cfg.blockMB << 20;
+    hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hd.Flags = D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;   // tier 2: buffers and all textures together
+    ID3D12Heap* heap = NULL;
+    if (FAILED(o_CH(g_sub.dev, &hd, IID_PPV_ARGS(&heap))) || !heap) { InterlockedIncrement(&g_sub.heapFails); return NULL; }
+    SubBlock* b = new SubBlock;
+    b->heap = heap;
+    b->pages = (UINT)(hd.SizeInBytes / SUB_PAGE);
+    b->freePages = b->pages;
+    b->bits = new UINT64[(b->pages + 63) / 64]();
+    g_sub.blocks[g_sub.count++] = b;
+    if (g_sub.count > g_cfg.prewarmBlocks)
+        Log("SUB: block %d added (%d MB pooled, %.1f MB in use)", g_sub.count, g_sub.count * g_cfg.blockMB,
+            g_sub.usedPages * SUB_PAGE / 1048576.0);
+    return b;
+}
+
+static int SubFindRun(const SubBlock* b, UINT n)
+{
+    for (UINT p = 0; p + n <= b->pages; )
+    {
+        if ((p & 63) == 0 && b->bits[p >> 6] == ~0ull) { p += 64; continue; }
+        UINT i = 0;
+        while (i < n && !((b->bits[(p + i) >> 6] >> ((p + i) & 63)) & 1)) ++i;
+        if (i == n) return (int)p;
+        p += i + 1;
+    }
+    return -1;
+}
+static void SubMark(SubBlock* b, UINT first, UINT n, bool used)
+{
+    for (UINT p = first; p < first + n; ++p)
+    {
+        UINT64 m = 1ull << (p & 63);
+        if (used) b->bits[p >> 6] |= m; else b->bits[p >> 6] &= ~m;
+    }
+}
+
+static bool SubAlloc(UINT64 bytes, SubSlot& out)
+{
+    UINT n = (UINT)((bytes + SUB_PAGE - 1) / SUB_PAGE);
+    AcquireSRWLockExclusive(&g_sub.lock);
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        for (int i = 0; i < g_sub.count; ++i)
+        {
+            SubBlock* b = g_sub.blocks[i];
+            if (b->freePages < n) continue;
+            int r = SubFindRun(b, n);
+            if (r < 0) continue;
+            SubMark(b, (UINT)r, n, true);
+            b->freePages -= n;
+            ReleaseSRWLockExclusive(&g_sub.lock);
+            InterlockedAdd64(&g_sub.usedPages, n);
+            out.block = b; out.first = (UINT)r; out.pages = n;
+            return true;
+        }
+        if (pass == 0 && !SubNewBlock()) break;
+    }
+    ReleaseSRWLockExclusive(&g_sub.lock);
+    return false;
+}
+static void SubFree(const SubSlot& s)
+{
+    AcquireSRWLockExclusive(&g_sub.lock);
+    SubMark(s.block, s.first, s.pages, false);
+    s.block->freePages += s.pages;
+    ReleaseSRWLockExclusive(&g_sub.lock);
+    InterlockedAdd64(&g_sub.usedPages, -(LONG64)s.pages);
+}
+
+// Held by the placed resource as private data; D3D12 releases it when it
+// destroys the resource, and the pages go back to the pool then.
+struct SubTracker final : IUnknown
+{
+    volatile LONG ref = 1;
+    SubSlot       slot;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** pp) override
+    {
+        if (riid == __uuidof(IUnknown)) { *pp = this; AddRef(); return S_OK; }
+        *pp = NULL; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        LONG r = InterlockedDecrement(&ref);
+        if (r == 0)
+        {
+            SubFree(slot);
+            InterlockedDecrement(&g_sub.live);
+            delete this;
+        }
+        return (ULONG)r;
+    }
+};
+
+// The shape the game's stutter is made of (see the header). Anything else
+// stays committed.
+static bool SubEligible(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf,
+                        const D3D12_RESOURCE_DESC* rd, const D3D12_CLEAR_VALUE* cv, void** pp,
+                        UINT64& bytes)
+{
+    if (!g_sub.on || !g_sub.tierOk || !pp || !hp || !rd || cv) return false;
+    if (hp->Type != D3D12_HEAP_TYPE_DEFAULT || hp->CreationNodeMask > 1 || hp->VisibleNodeMask > 1) return false;
+    if (hf != D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) return false;
+    if (rd->Flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) return false;
+    if (rd->SampleDesc.Count != 1 || rd->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) return false;
+    D3D12_RESOURCE_ALLOCATION_INFO ai = d->GetResourceAllocationInfo(0, 1, rd);
+    if (ai.SizeInBytes == UINT64_MAX || ai.SizeInBytes == 0) return false;
+    if (ai.SizeInBytes > (UINT64)g_cfg.maxResourceKB * 1024 || ai.Alignment > SUB_PAGE) return false;
+    bytes = ai.SizeInBytes;
+    return true;
+}
+
+// The placed resource exists: tie its pages to its lifetime. On failure the
+// resource is released before its pages are, so they are never reused live.
+static bool SubAttach(void** pp, const SubSlot& slot)
+{
+    ID3D12Object* obj = NULL;
+    SubTracker* t = new SubTracker;
+    t->slot = slot;
+    HRESULT hr = ((IUnknown*)*pp)->QueryInterface(IID_PPV_ARGS(&obj));
+    if (SUCCEEDED(hr))
+    {
+        hr = obj->SetPrivateDataInterface(SUB_TRACKER_GUID, t);
+        obj->Release();
+    }
+    if (FAILED(hr))
+    {
+        ((IUnknown*)*pp)->Release();
+        *pp = NULL;
+        t->Release();   // frees the pages, now that nothing uses them
+        return false;
+    }
+    InterlockedIncrement(&g_sub.live);
+    InterlockedIncrement(&g_sub.made);
+    t->Release();       // the resource holds the only reference now
+    return true;
+}
+
+// One attempt for every committed variant: place(heap, offset) does the
+// variant's own placed call. False = take the committed path as usual.
+template <class F>
+static bool SubTry(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf,
+                   const D3D12_RESOURCE_DESC* rd, const D3D12_CLEAR_VALUE* cv, void** pp,
+                   UINT64& bytes, HRESULT& hr, F place)
+{
+    if (!SubEligible(d, hp, hf, rd, cv, pp, bytes)) return false;
+    SubSlot slot;
+    if (!SubAlloc(bytes, slot)) { InterlockedIncrement(&g_sub.fellBack); return false; }
+    hr = place(slot.block->heap, (UINT64)slot.first * SUB_PAGE);
+    if (FAILED(hr) || !*pp)
+    {
+        SubFree(slot);
+        InterlockedIncrement(&g_sub.fellBack);
+        return false;
+    }
+    if (!SubAttach(pp, slot)) { InterlockedIncrement(&g_sub.fellBack); return false; }
+    return true;
+}
+
+static void SubPrewarm(ID3D12Device* dev)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
+    bool tier = SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o))) &&
+                o.ResourceHeapTier >= D3D12_RESOURCE_HEAP_TIER_2;
+    g_sub.dev = dev;   // the game's device: alive for the whole session
+    g_sub.tierOk = tier;
+    if (!tier)
+    {
+        Log("setup: suballocation UNAVAILABLE (resource heap tier %d; needs 2) - the game runs as shipped", (int)o.ResourceHeapTier);
+        return;
+    }
+    int made = 0;
+    AcquireSRWLockExclusive(&g_sub.lock);
+    for (int i = 0; i < g_cfg.prewarmBlocks; ++i) if (SubNewBlock()) ++made;
+    ReleaseSRWLockExclusive(&g_sub.lock);
+    InterlockedExchange(&g_sub.on, g_cfg.suballocate);
+    Log("setup: suballocation %s | %d of %d blocks of %d MB made | resources up to %d KB",
+        g_sub.on ? "ON" : "off (ToggleKey switches it)", made, g_cfg.prewarmBlocks, g_cfg.blockMB, g_cfg.maxResourceKB);
+}
+
 static HRESULT STDMETHODCALLTYPE h_CCR(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf,
     const D3D12_RESOURCE_DESC* rd, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** pp)
 {
     CallScope s;
-    HRESULT hr = o_CCR(d, hp, hf, rd, st, cv, riid, pp);
+    UINT64 bytes = 0; HRESULT hr;
+    if (o_CPR && SubTry(d, hp, hf, rd, cv, pp, bytes, hr,
+            [&](ID3D12Heap* h, UINT64 off) { return o_CPR(d, h, off, rd, st, NULL, riid, pp); }))
+    { Finish(s, K_SUB, hr, bytes, hp, hf, rd, 0); return hr; }
+    hr = o_CCR(d, hp, hf, rd, st, cv, riid, pp);
     Finish(s, K_COMMITTED, hr, ResourceBytes(d, rd), hp, hf, rd, 0);
     return hr;
 }
@@ -417,7 +696,11 @@ static HRESULT STDMETHODCALLTYPE h_CCR1(ID3D12Device* d, const D3D12_HEAP_PROPER
     ID3D12ProtectedResourceSession* ps, REFIID riid, void** pp)
 {
     CallScope s;
-    HRESULT hr = o_CCR1(d, hp, hf, rd, st, cv, ps, riid, pp);
+    UINT64 bytes = 0; HRESULT hr;
+    if (!ps && o_CPR && SubTry(d, hp, hf, rd, cv, pp, bytes, hr,
+            [&](ID3D12Heap* h, UINT64 off) { return o_CPR(d, h, off, rd, st, NULL, riid, pp); }))
+    { Finish(s, K_SUB1, hr, bytes, hp, hf, rd, 0); return hr; }
+    hr = o_CCR1(d, hp, hf, rd, st, cv, ps, riid, pp);
     Finish(s, K_COMMITTED1, hr, ResourceBytes(d, rd), hp, hf, rd, 0);
     return hr;
 }
@@ -426,7 +709,11 @@ static HRESULT STDMETHODCALLTYPE h_CCR2(ID3D12Device* d, const D3D12_HEAP_PROPER
     ID3D12ProtectedResourceSession* ps, REFIID riid, void** pp)
 {
     CallScope s;
-    HRESULT hr = o_CCR2(d, hp, hf, rd, st, cv, ps, riid, pp);
+    UINT64 bytes = 0; HRESULT hr;
+    if (!ps && o_CPR1 && SubTry(d, hp, hf, DESC(rd), cv, pp, bytes, hr,
+            [&](ID3D12Heap* h, UINT64 off) { return o_CPR1(d, h, off, rd, st, NULL, riid, pp); }))
+    { Finish(s, K_SUB2, hr, bytes, hp, hf, DESC(rd), 0); return hr; }
+    hr = o_CCR2(d, hp, hf, rd, st, cv, ps, riid, pp);
     Finish(s, K_COMMITTED2, hr, ResourceBytes(d, DESC(rd)), hp, hf, DESC(rd), 0);
     return hr;
 }
@@ -435,7 +722,11 @@ static HRESULT STDMETHODCALLTYPE h_CCR3(ID3D12Device* d, const D3D12_HEAP_PROPER
     ID3D12ProtectedResourceSession* ps, UINT32 nf, const DXGI_FORMAT* fmts, REFIID riid, void** pp)
 {
     CallScope s;
-    HRESULT hr = o_CCR3(d, hp, hf, rd, lay, cv, ps, nf, fmts, riid, pp);
+    UINT64 bytes = 0; HRESULT hr;
+    if (!ps && o_CPR2 && SubTry(d, hp, hf, DESC(rd), cv, pp, bytes, hr,
+            [&](ID3D12Heap* h, UINT64 off) { return o_CPR2(d, h, off, rd, lay, NULL, nf, fmts, riid, pp); }))
+    { Finish(s, K_SUB3, hr, bytes, hp, hf, DESC(rd), 0); return hr; }
+    hr = o_CCR3(d, hp, hf, rd, lay, cv, ps, nf, fmts, riid, pp);
     Finish(s, K_COMMITTED3, hr, ResourceBytes(d, DESC(rd)), hp, hf, DESC(rd), 0);
     return hr;
 }
@@ -660,10 +951,10 @@ static void OnFrame()
         for (int k = 0; k < 3 && top[k].slot >= 0; ++k)
             p += _snprintf_s(tops + p, sizeof(tops) - p, _TRUNCATE, "%s%s %.1f ms/%ld (wait %.1f)",
                              k ? ", " : "", g_slots[top[k].slot].name, Ms(top[k].ticks), top[k].n, Ms(top[k].wait));
-        Log("HITCH %.1f ms | creates %ld (committed %ld, heap %ld, placed %ld, reserved %ld, residency %ld) %.1f MB"
-            " | thread-ms in creates %.1f (residency wait %.1f) | other KMT waits %.1f | top: %s",
-            ms, creates, cnt[C_COMMITTED], cnt[C_HEAP], cnt[C_PLACED], cnt[C_RESERVED], cnt[C_RESIDENCY],
-            by / 1048576.0, Ms(ct), Ms(wt), Ms(ot), tops[0] ? tops : "-");
+        Log("HITCH %.1f ms | creates %ld (committed %ld, sub %ld, heap %ld, placed %ld, reserved %ld, residency %ld) %.1f MB"
+            " | thread-ms in creates %.1f (residency wait %.1f) | other KMT waits %.1f | fix %s | top: %s",
+            ms, creates, cnt[C_COMMITTED], cnt[C_SUB], cnt[C_HEAP], cnt[C_PLACED], cnt[C_RESERVED], cnt[C_RESIDENCY],
+            by / 1048576.0, Ms(ct), Ms(wt), Ms(ot), g_sub.on ? "on" : "off", tops[0] ? tops : "-");
     }
 
     if (Ms(now - g_stats.windowStart) >= 30000.0)
@@ -673,6 +964,10 @@ static void OnFrame()
             Ms(now - g_stats.windowStart) / 1000.0, g_stats.frames, g_stats.frameMs / (g_stats.frames ? g_stats.frames : 1),
             g_stats.worstMs, g_stats.hitches, g_stats.creates,
             g_stats.creates / (double)(g_stats.frames ? g_stats.frames : 1), g_stats.mb, g_stats.createMs, g_stats.waitMs);
+        if (g_sub.count)
+            Log("SUB fix %s | %d blocks (%d MB) | %.1f MB in use | %ld live, %ld made, %ld fell back, %ld block failures",
+                g_sub.on ? "on" : "off", g_sub.count, g_sub.count * g_cfg.blockMB, g_sub.usedPages * SUB_PAGE / 1048576.0,
+                g_sub.live, g_sub.made, g_sub.fellBack, g_sub.heapFails);
         LONGLONG keepLast = g_stats.last;
         g_stats = Stats();
         g_stats.last = keepLast; g_stats.windowStart = now;
@@ -749,6 +1044,7 @@ static DWORD WINAPI PresentHookThread(LPVOID param)
         }
     }
     else Log("setup: Present hook NOT INSTALLED (%s failed) - no frame timing; PresentMon still lines up by QPC", fail);
+    SubPrewarm(dev);
     if (sc) sc->Release();
     if (fac) fac->Release();
     if (q) q->Release();
@@ -887,9 +1183,9 @@ static void WriteEvent(const Event& e)
     switch (CatOf((Kind)e.kind))
     {
     case C_COMMITTED:
+    case C_SUB:
     case C_PLACED:
     case C_RESERVED:
-        if (e.kind == K_FRAME) break;
         LogAt(e.qpc, "CR %-10s %-26s %-8s hf=0x%03X | %-5s %llux%ux%u mips %u fmt %u rf=0x%02X | %9.1f KB | %.3f ms (wait %.3f)%s",
               KIND_NAME[e.kind], who, HeapTypeName(e.heapType), e.heapFlags, DimName(e.dim),
               (unsigned long long)e.width, e.height, e.depth, e.mips, e.format, e.resFlags,
@@ -1013,15 +1309,31 @@ static DWORD WINAPI CaptureLog(LPVOID param)
     return 0;
 }
 
-static DWORD WINAPI CaptureThread(LPVOID)
+// The capture key (Logging 2) and the fix's toggle key (any level).
+static DWORD WINAPI KeyThread(LPVOID)
 {
-    WORD vk = KeyVk(g_cfg.captureKey);
-    if (!vk) return 0;
-    bool was = false;
+    WORD vk = (g_cfg.logging == 2 && g_ring) ? KeyVk(g_cfg.captureKey) : 0;
+    WORD tk = KeyVk(g_cfg.toggleKey);
+    if (!vk && !tk) return 0;
+    bool was = false, tWas = false;
     for (;;)
     {
         Sleep(30);
-        bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        bool tDown = tk && (GetAsyncKeyState(tk) & 0x8000) != 0;
+        if (tDown && !tWas && GameHasFocus())
+        {
+            if (!g_sub.tierOk) Log("FIX: suballocation can't be switched on (not available on this GPU, or the device isn't found yet)");
+            else
+            {
+                LONG now = !g_sub.on;
+                InterlockedExchange(&g_sub.on, now);
+                Log("FIX: suballocation switched %s by the player | %d blocks, %.1f MB in use, %ld live, %ld made, %ld fell back",
+                    now ? "ON" : "OFF", g_sub.count, g_sub.usedPages * SUB_PAGE / 1048576.0,
+                    g_sub.live, g_sub.made, g_sub.fellBack);
+            }
+        }
+        tWas = tDown;
+        bool down = vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
         if (down && !was && GameHasFocus() && InterlockedCompareExchange(&g_captureBusy, 1, 0) == 0)
         {
             Sleep(250);   // let the writer drain the frames up to the key press
@@ -1070,6 +1382,9 @@ static DWORD WINAPI InitThread(LPVOID)
                            : "config loaded from ishimurapatch.ini");
     Log("config: Logging = %d | HitchMs = %d | CaptureKey = %s", g_cfg.logging, g_cfg.hitchMs,
         g_cfg.captureKey[0] ? g_cfg.captureKey : "(off)");
+    Log("config: Suballocate = %d | ToggleKey = %s | BlockMB = %d | PrewarmBlocks = %d | MaxResourceKB = %d",
+        g_cfg.suballocate, g_cfg.toggleKey[0] ? g_cfg.toggleKey : "(off)", g_cfg.blockMB,
+        g_cfg.prewarmBlocks, g_cfg.maxResourceKB);
     {
         char exe[MAX_PATH] = {};
         GetModuleFileNameA(NULL, exe, MAX_PATH);
@@ -1103,10 +1418,8 @@ static DWORD WINAPI InitThread(LPVOID)
     HANDLE t;
     if ((t = CreateThread(NULL, 0, FallbackThread, NULL, 0, NULL))) CloseHandle(t);
     if (g_cfg.logging == 2 && g_ring)
-    {
         if ((t = CreateThread(NULL, 0, WriterThread, NULL, 0, NULL))) CloseHandle(t);
-        if ((t = CreateThread(NULL, 0, CaptureThread, NULL, 0, NULL))) CloseHandle(t);
-    }
+    if ((t = CreateThread(NULL, 0, KeyThread, NULL, 0, NULL))) CloseHandle(t);
     return 0;
 }
 
