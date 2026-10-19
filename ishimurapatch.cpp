@@ -35,6 +35,11 @@
 //  initialization rules apply. A resource's pages go back to the pool when
 //  D3D12 destroys it (a tracker set with SetPrivateDataInterface is released
 //  then). Anything that fails falls back to the committed path.
+//  0.2.1, from the 0.2.0 A/B: with the fix on, the creates left committed
+//  were textures over 4 MB (~1 ms each, 389 ms a minute) and 64 KB READBACK
+//  buffers in batches of ~50 (15-17 ms frames). The size cap is now 16 MB,
+//  UPLOAD and READBACK buffers get their own pools, and blocks are made
+//  ahead of need on a background thread instead of mid-burst.
 //
 //  Logging (ishimurapatch.ini): 1 = what was hooked, a HITCH line per slow
 //  frame, a STATS line every 30 s. 2 = also every request and every frame,
@@ -57,7 +62,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "version.lib")
 
-static const char* MOD_VERSION = "0.2.0";
+static const char* MOD_VERSION = "0.2.1";
 
 extern "C" {
 extern const int VT_GetResourceAllocationInfo, VT_CreateCommittedResource, VT_CreateHeap,
@@ -86,9 +91,12 @@ struct Config
     char captureKey[32] = "F8";
     int  suballocate = 0;
     char toggleKey[32] = "F9";
-    int  blockMB = 64;
+    int  blockMB = 128;
     int  prewarmBlocks = 4;
-    int  maxResourceKB = 4096;
+    int  maxResourceKB = 16384;
+    int  maxPoolMB = 4096;
+    int  hostBlockMB = 32;
+    int  maxHostPoolMB = 512;
 };
 static Config g_cfg;
 
@@ -134,13 +142,24 @@ static const char* DEFAULT_INI =
 "; from then on. F1-F12 or a letter; empty = off.\n"
 "ToggleKey = F9\n"
 "\n"
-"; Size of each large block (MB, 16-256), how many are made when the game\n"
-"; starts (0-16; more are added as needed), and the largest single\n"
-"; resource carved out of them (KB, 64-16384). Larger ones stay as the\n"
-"; game made them.\n"
-"BlockMB = 64\n"
+"; The large blocks in graphics memory: their size (MB, 16-256), how many\n"
+"; are made when the game starts (0-16; more are added in the background\n"
+"; before they're needed), and the most they may total (MB, 256-16384).\n"
+"; At that limit, further requests are left as the game made them, so\n"
+"; this caps the extra graphics memory the fix can hold.\n"
+"BlockMB = 128\n"
 "PrewarmBlocks = 4\n"
-"MaxResourceKB = 4096\n";
+"MaxPoolMB = 4096\n"
+"\n"
+"; The largest single resource carved out of a block (KB, 64-16384; never\n"
+"; more than half a block). Larger ones stay as the game made them.\n"
+"MaxResourceKB = 16384\n"
+"\n"
+"; The same for the small buffers the CPU and GPU pass data through\n"
+"; (system memory, not graphics memory): block size (MB, 4-64) and the\n"
+"; most they may total (MB, 16-2048).\n"
+"HostBlockMB = 32\n"
+"MaxHostPoolMB = 512\n";
 
 static void LoadConfig()
 {
@@ -172,13 +191,20 @@ static void LoadConfig()
     g_cfg.blockMB       = GetPrivateProfileIntA("Fix", "BlockMB", fb.blockMB, g_files.iniPath);
     g_cfg.prewarmBlocks = GetPrivateProfileIntA("Fix", "PrewarmBlocks", fb.prewarmBlocks, g_files.iniPath);
     g_cfg.maxResourceKB = GetPrivateProfileIntA("Fix", "MaxResourceKB", fb.maxResourceKB, g_files.iniPath);
+    g_cfg.maxPoolMB     = GetPrivateProfileIntA("Fix", "MaxPoolMB", fb.maxPoolMB, g_files.iniPath);
+    g_cfg.hostBlockMB   = GetPrivateProfileIntA("Fix", "HostBlockMB", fb.hostBlockMB, g_files.iniPath);
+    g_cfg.maxHostPoolMB = GetPrivateProfileIntA("Fix", "MaxHostPoolMB", fb.maxHostPoolMB, g_files.iniPath);
     if (g_cfg.logging < 0 || g_cfg.logging > 2) g_cfg.logging = 1;
     if (g_cfg.hitchMs < 1) g_cfg.hitchMs = fb.hitchMs;
     g_cfg.suballocate = g_cfg.suballocate ? 1 : 0;
     if (g_cfg.blockMB < 16 || g_cfg.blockMB > 256) g_cfg.blockMB = fb.blockMB;
     if (g_cfg.prewarmBlocks < 0 || g_cfg.prewarmBlocks > 16) g_cfg.prewarmBlocks = fb.prewarmBlocks;
     if (g_cfg.maxResourceKB < 64 || g_cfg.maxResourceKB > 16384) g_cfg.maxResourceKB = fb.maxResourceKB;
-    if (g_cfg.maxResourceKB > g_cfg.blockMB * 1024) g_cfg.maxResourceKB = g_cfg.blockMB * 1024;
+    if (g_cfg.maxPoolMB < 256 || g_cfg.maxPoolMB > 16384) g_cfg.maxPoolMB = fb.maxPoolMB;
+    if (g_cfg.maxPoolMB < g_cfg.blockMB) g_cfg.maxPoolMB = g_cfg.blockMB;
+    if (g_cfg.hostBlockMB < 4 || g_cfg.hostBlockMB > 64) g_cfg.hostBlockMB = fb.hostBlockMB;
+    if (g_cfg.maxHostPoolMB < 16 || g_cfg.maxHostPoolMB > 2048) g_cfg.maxHostPoolMB = fb.maxHostPoolMB;
+    if (g_cfg.maxHostPoolMB < g_cfg.hostBlockMB) g_cfg.maxHostPoolMB = g_cfg.hostBlockMB;
 }
 
 // ----------------------------------------------------------------------------
@@ -463,28 +489,46 @@ static PFN_RES  o_MakeResident, o_Evict;
 static PFN_ENQ  o_Enqueue;
 
 // ----------------------------------------------------------------------------
-// Suballocation: 64 KB pages in large DEFAULT heaps, one bitmap per heap,
-// first fit. Heaps are never released (the pool only grows). Every call
-// that reaches the pool holds one SRW lock; a new heap is made under it.
+// Suballocation: 64 KB pages in large heaps, one bitmap per heap, first fit.
+// Three pools, one per heap type the game makes small committed resources
+// in: DEFAULT (GPU-only: textures and buffers), UPLOAD and READBACK (CPU-
+// visible: buffers only, the only kind D3D12 allows there). Heaps are never
+// released; each pool stops growing at its cap and falls back to committed.
+// A grower thread keeps a block's worth of free space in every pool so a
+// burst never waits for a new heap (0.2.0 added blocks mid-pass, at ~4 ms
+// each); a pool that still runs dry makes one itself, outside the lock.
 // ----------------------------------------------------------------------------
 static const UINT64 SUB_PAGE = 65536;
+static const int SUB_MAX_BLOCKS = 256;
+struct SubPool;
 struct SubBlock
 {
+    SubPool*    pool;
     ID3D12Heap* heap;
     UINT64*     bits;        // 1 = page in use
     UINT        pages, freePages;
 };
-static const int SUB_MAX_BLOCKS = 256;
+enum PoolId { POOL_DEFAULT, POOL_UPLOAD, POOL_READBACK, POOL_COUNT };
+struct SubPool
+{
+    const char*      name;
+    D3D12_HEAP_TYPE  type;
+    D3D12_HEAP_FLAGS heapFlags;
+    UINT64           blockBytes, maxResource;
+    int              maxBlocks, prewarm;
+    SubBlock*        blocks[SUB_MAX_BLOCKS];
+    volatile LONG    count;
+    volatile LONG64  totalPages, freePages;
+};
 struct SubState
 {
     SRWLOCK        lock = SRWLOCK_INIT;
-    SubBlock*      blocks[SUB_MAX_BLOCKS] = {};
-    int            count = 0;
+    SubPool        pools[POOL_COUNT] = {};
     volatile LONG  on = 0;
     ID3D12Device*  dev = NULL;
     bool           tierOk = false;
-    volatile LONG  live = 0, made = 0, fellBack = 0, heapFails = 0;
-    volatile LONG64 usedPages = 0;
+    HANDLE         growEvent = NULL;
+    volatile LONG  live = 0, made = 0, fellBack = 0, heapFails = 0, capped = 0;
 };
 static SubState g_sub;
 
@@ -493,24 +537,81 @@ static const GUID SUB_TRACKER_GUID = { 0x7b3e6a51, 0x2c4d, 0x4f88, { 0x9a, 0x1e,
 
 struct SubSlot { SubBlock* block; UINT first, pages; };
 
-static SubBlock* SubNewBlock()   // under the lock
+static void SubSetupPools()
 {
-    if (g_sub.count >= SUB_MAX_BLOCKS || !o_CH || !g_sub.dev) return NULL;
+    struct { const char* name; D3D12_HEAP_TYPE type; D3D12_HEAP_FLAGS flags; int blockMB, maxMB, prewarm; } def[POOL_COUNT] = {
+        { "DEFAULT",  D3D12_HEAP_TYPE_DEFAULT,  D3D12_HEAP_FLAG_CREATE_NOT_ZEROED,
+          g_cfg.blockMB, g_cfg.maxPoolMB, g_cfg.prewarmBlocks },
+        { "UPLOAD",   D3D12_HEAP_TYPE_UPLOAD,   D3D12_HEAP_FLAG_CREATE_NOT_ZEROED | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+          g_cfg.hostBlockMB, g_cfg.maxHostPoolMB, 1 },
+        { "READBACK", D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+          g_cfg.hostBlockMB, g_cfg.maxHostPoolMB, 1 },
+    };
+    for (int i = 0; i < POOL_COUNT; ++i)
+    {
+        SubPool& p = g_sub.pools[i];
+        p.name = def[i].name; p.type = def[i].type; p.heapFlags = def[i].flags;
+        p.blockBytes = (UINT64)def[i].blockMB << 20;
+        p.maxBlocks = def[i].maxMB / def[i].blockMB;
+        if (p.maxBlocks > SUB_MAX_BLOCKS) p.maxBlocks = SUB_MAX_BLOCKS;
+        p.prewarm = def[i].prewarm < p.maxBlocks ? def[i].prewarm : p.maxBlocks;
+        // a resource never takes more than half a block, so one never strands most of one
+        UINT64 cap = (UINT64)g_cfg.maxResourceKB * 1024;
+        p.maxResource = cap < p.blockBytes / 2 ? cap : p.blockBytes / 2;
+    }
+}
+
+static double PoolMB(LONG64 pages) { return pages * (double)SUB_PAGE / 1048576.0; }
+
+// One line per pool, for STATS, the toggle and new blocks.
+static void SubSummary(char* out, size_t n)
+{
+    int p = 0; out[0] = 0;
+    for (int i = 0; i < POOL_COUNT; ++i)
+    {
+        const SubPool& s = g_sub.pools[i];
+        p += _snprintf_s(out + p, n - p, _TRUNCATE, "%s%s %ld x %llu MB, %.1f MB used",
+                         i ? " | " : "", s.name, s.count, s.blockBytes >> 20, PoolMB(s.totalPages - s.freePages));
+    }
+}
+
+// Makes one heap outside the lock, then adds it under the lock.
+static SubBlock* SubGrow(SubPool& p, const char* why)
+{
+    if (!o_CH || !g_sub.dev || p.count >= p.maxBlocks) return NULL;
     D3D12_HEAP_DESC hd = {};
-    hd.SizeInBytes = (UINT64)g_cfg.blockMB << 20;
-    hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
-    hd.Flags = D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;   // tier 2: buffers and all textures together
+    hd.SizeInBytes = p.blockBytes;
+    hd.Properties.Type = p.type;
+    hd.Flags = p.heapFlags;   // DEFAULT on tier 2: buffers and all textures together
     ID3D12Heap* heap = NULL;
-    if (FAILED(o_CH(g_sub.dev, &hd, IID_PPV_ARGS(&heap))) || !heap) { InterlockedIncrement(&g_sub.heapFails); return NULL; }
+    LONGLONG t0 = Now();
+    if (FAILED(o_CH(g_sub.dev, &hd, IID_PPV_ARGS(&heap))) || !heap)
+    {
+        InterlockedIncrement(&g_sub.heapFails);
+        Log("SUB: %s block FAILED to create (%llu MB) - that pool falls back to committed until one fits", p.name, p.blockBytes >> 20);
+        return NULL;
+    }
+    double ms = Ms(Now() - t0);
     SubBlock* b = new SubBlock;
+    b->pool = &p;
     b->heap = heap;
-    b->pages = (UINT)(hd.SizeInBytes / SUB_PAGE);
+    b->pages = (UINT)(p.blockBytes / SUB_PAGE);
     b->freePages = b->pages;
     b->bits = new UINT64[(b->pages + 63) / 64]();
-    g_sub.blocks[g_sub.count++] = b;
-    if (g_sub.count > g_cfg.prewarmBlocks)
-        Log("SUB: block %d added (%d MB pooled, %.1f MB in use)", g_sub.count, g_sub.count * g_cfg.blockMB,
-            g_sub.usedPages * SUB_PAGE / 1048576.0);
+    AcquireSRWLockExclusive(&g_sub.lock);
+    bool room = p.count < p.maxBlocks;
+    if (room)
+    {
+        p.blocks[p.count] = b;
+        InterlockedIncrement(&p.count);
+        InterlockedAdd64(&p.totalPages, b->pages);
+        InterlockedAdd64(&p.freePages, b->pages);
+    }
+    ReleaseSRWLockExclusive(&g_sub.lock);
+    if (!room) { heap->Release(); delete[] b->bits; delete b; return NULL; }   // two growers raced past the cap
+    if (why)
+        Log("SUB: %s block %ld added (%s, %.1f ms) | %.0f MB pooled, %.1f MB used", p.name, p.count, why, ms,
+            PoolMB(p.totalPages), PoolMB(p.totalPages - p.freePages));
     return b;
 }
 
@@ -535,37 +636,61 @@ static void SubMark(SubBlock* b, UINT first, UINT n, bool used)
     }
 }
 
-static bool SubAlloc(UINT64 bytes, SubSlot& out)
+static bool SubAllocFrom(SubPool& p, UINT n, SubSlot& out)
 {
-    UINT n = (UINT)((bytes + SUB_PAGE - 1) / SUB_PAGE);
+    bool ok = false;
     AcquireSRWLockExclusive(&g_sub.lock);
-    for (int pass = 0; pass < 2; ++pass)
+    for (LONG i = 0; i < p.count && !ok; ++i)
     {
-        for (int i = 0; i < g_sub.count; ++i)
-        {
-            SubBlock* b = g_sub.blocks[i];
-            if (b->freePages < n) continue;
-            int r = SubFindRun(b, n);
-            if (r < 0) continue;
-            SubMark(b, (UINT)r, n, true);
-            b->freePages -= n;
-            ReleaseSRWLockExclusive(&g_sub.lock);
-            InterlockedAdd64(&g_sub.usedPages, n);
-            out.block = b; out.first = (UINT)r; out.pages = n;
-            return true;
-        }
-        if (pass == 0 && !SubNewBlock()) break;
+        SubBlock* b = p.blocks[i];
+        if (b->freePages < n) continue;
+        int r = SubFindRun(b, n);
+        if (r < 0) continue;
+        SubMark(b, (UINT)r, n, true);
+        b->freePages -= n;
+        InterlockedAdd64(&p.freePages, -(LONG64)n);
+        out.block = b; out.first = (UINT)r; out.pages = n;
+        ok = true;
     }
     ReleaseSRWLockExclusive(&g_sub.lock);
-    return false;
+    return ok;
+}
+
+static bool SubAlloc(SubPool& p, UINT64 bytes, SubSlot& out)
+{
+    UINT n = (UINT)((bytes + SUB_PAGE - 1) / SUB_PAGE);
+    bool ok = SubAllocFrom(p, n, out);
+    if (!ok)
+    {
+        if (p.count >= p.maxBlocks) { InterlockedIncrement(&g_sub.capped); return false; }
+        ok = SubGrow(p, "ran dry mid-burst") && SubAllocFrom(p, n, out);
+    }
+    if (p.freePages < (LONG64)(p.blockBytes / SUB_PAGE) && p.count < p.maxBlocks && g_sub.growEvent)
+        SetEvent(g_sub.growEvent);   // keep a block's worth free ahead of the next burst
+    return ok;
 }
 static void SubFree(const SubSlot& s)
 {
     AcquireSRWLockExclusive(&g_sub.lock);
     SubMark(s.block, s.first, s.pages, false);
     s.block->freePages += s.pages;
+    InterlockedAdd64(&s.block->pool->freePages, s.pages);
     ReleaseSRWLockExclusive(&g_sub.lock);
-    InterlockedAdd64(&g_sub.usedPages, -(LONG64)s.pages);
+}
+
+static DWORD WINAPI SubGrowThread(LPVOID)
+{
+    for (;;)
+    {
+        WaitForSingleObject(g_sub.growEvent, 1000);
+        for (int i = 0; i < POOL_COUNT; ++i)
+        {
+            SubPool& p = g_sub.pools[i];
+            while (g_sub.on && p.count > 0 && p.count < p.maxBlocks &&
+                   p.freePages < (LONG64)(p.blockBytes / SUB_PAGE))
+                if (!SubGrow(p, "ahead of need")) break;
+        }
+    }
 }
 
 // Held by the placed resource as private data; D3D12 releases it when it
@@ -593,22 +718,39 @@ struct SubTracker final : IUnknown
     }
 };
 
-// The shape the game's stutter is made of (see the header). Anything else
-// stays committed.
-static bool SubEligible(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf,
-                        const D3D12_RESOURCE_DESC* rd, const D3D12_CLEAR_VALUE* cv, void** pp,
-                        UINT64& bytes)
+// The shape the game's stutter is made of (see the header): the pool it
+// goes to, or NULL to stay committed. DEFAULT takes buffers and textures
+// (no render target or depth flags: placed ones of those need explicit
+// initialization the game may not do); UPLOAD and READBACK take plain buffers.
+static SubPool* SubEligible(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf,
+                            const D3D12_RESOURCE_DESC* rd, const D3D12_CLEAR_VALUE* cv, void** pp,
+                            UINT64& bytes)
 {
-    if (!g_sub.on || !g_sub.tierOk || !pp || !hp || !rd || cv) return false;
-    if (hp->Type != D3D12_HEAP_TYPE_DEFAULT || hp->CreationNodeMask > 1 || hp->VisibleNodeMask > 1) return false;
-    if (hf != D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) return false;
-    if (rd->Flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) return false;
-    if (rd->SampleDesc.Count != 1 || rd->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) return false;
+    if (!g_sub.on || !g_sub.tierOk || !pp || !hp || !rd || cv) return NULL;
+    if (hp->CreationNodeMask > 1 || hp->VisibleNodeMask > 1) return NULL;
+    if (hf != D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) return NULL;
+    if (rd->SampleDesc.Count != 1 || rd->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) return NULL;
+    SubPool* p = NULL;
+    switch (hp->Type)
+    {
+    case D3D12_HEAP_TYPE_DEFAULT:
+        if (rd->Flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) return NULL;
+        p = &g_sub.pools[POOL_DEFAULT];
+        break;
+    case D3D12_HEAP_TYPE_UPLOAD:
+    case D3D12_HEAP_TYPE_READBACK:
+        if (rd->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || rd->Flags) return NULL;
+        p = &g_sub.pools[hp->Type == D3D12_HEAP_TYPE_UPLOAD ? POOL_UPLOAD : POOL_READBACK];
+        break;
+    default:
+        return NULL;   // CUSTOM, GPU_UPLOAD: left as the game made them
+    }
+    if (p->maxBlocks <= 0) return NULL;
     D3D12_RESOURCE_ALLOCATION_INFO ai = d->GetResourceAllocationInfo(0, 1, rd);
-    if (ai.SizeInBytes == UINT64_MAX || ai.SizeInBytes == 0) return false;
-    if (ai.SizeInBytes > (UINT64)g_cfg.maxResourceKB * 1024 || ai.Alignment > SUB_PAGE) return false;
+    if (ai.SizeInBytes == UINT64_MAX || ai.SizeInBytes == 0) return NULL;
+    if (ai.SizeInBytes > p->maxResource || ai.Alignment > SUB_PAGE) return NULL;
     bytes = ai.SizeInBytes;
-    return true;
+    return p;
 }
 
 // The placed resource exists: tie its pages to its lifetime. On failure the
@@ -644,9 +786,10 @@ static bool SubTry(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_
                    const D3D12_RESOURCE_DESC* rd, const D3D12_CLEAR_VALUE* cv, void** pp,
                    UINT64& bytes, HRESULT& hr, F place)
 {
-    if (!SubEligible(d, hp, hf, rd, cv, pp, bytes)) return false;
+    SubPool* pool = SubEligible(d, hp, hf, rd, cv, pp, bytes);
+    if (!pool) return false;
     SubSlot slot;
-    if (!SubAlloc(bytes, slot)) { InterlockedIncrement(&g_sub.fellBack); return false; }
+    if (!SubAlloc(*pool, bytes, slot)) { InterlockedIncrement(&g_sub.fellBack); return false; }
     hr = place(slot.block->heap, (UINT64)slot.first * SUB_PAGE);
     if (FAILED(hr) || !*pp)
     {
@@ -670,13 +813,22 @@ static void SubPrewarm(ID3D12Device* dev)
         Log("setup: suballocation UNAVAILABLE (resource heap tier %d; needs 2) - the game runs as shipped", (int)o.ResourceHeapTier);
         return;
     }
-    int made = 0;
-    AcquireSRWLockExclusive(&g_sub.lock);
-    for (int i = 0; i < g_cfg.prewarmBlocks; ++i) if (SubNewBlock()) ++made;
-    ReleaseSRWLockExclusive(&g_sub.lock);
+    SubSetupPools();
+    LONGLONG t0 = Now();
+    for (int i = 0; i < POOL_COUNT; ++i)
+        for (int k = 0; k < g_sub.pools[i].prewarm; ++k)
+            if (!SubGrow(g_sub.pools[i], NULL)) break;
+    double ms = Ms(Now() - t0);
+    g_sub.growEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
+    HANDLE t = CreateThread(NULL, 0, SubGrowThread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
     InterlockedExchange(&g_sub.on, g_cfg.suballocate);
-    Log("setup: suballocation %s | %d of %d blocks of %d MB made | resources up to %d KB",
-        g_sub.on ? "ON" : "off (ToggleKey switches it)", made, g_cfg.prewarmBlocks, g_cfg.blockMB, g_cfg.maxResourceKB);
+    char sum[256];
+    SubSummary(sum, sizeof(sum));
+    Log("setup: suballocation %s | prewarmed in %.1f ms: %s | resources up to %d KB (host pools %d KB) | caps %d MB / %d MB",
+        g_sub.on ? "ON" : "off (ToggleKey switches it)", ms, sum,
+        (int)(g_sub.pools[POOL_DEFAULT].maxResource / 1024), (int)(g_sub.pools[POOL_UPLOAD].maxResource / 1024),
+        g_cfg.maxPoolMB, g_cfg.maxHostPoolMB);
 }
 
 static HRESULT STDMETHODCALLTYPE h_CCR(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf,
@@ -964,10 +1116,13 @@ static void OnFrame()
             Ms(now - g_stats.windowStart) / 1000.0, g_stats.frames, g_stats.frameMs / (g_stats.frames ? g_stats.frames : 1),
             g_stats.worstMs, g_stats.hitches, g_stats.creates,
             g_stats.creates / (double)(g_stats.frames ? g_stats.frames : 1), g_stats.mb, g_stats.createMs, g_stats.waitMs);
-        if (g_sub.count)
-            Log("SUB fix %s | %d blocks (%d MB) | %.1f MB in use | %ld live, %ld made, %ld fell back, %ld block failures",
-                g_sub.on ? "on" : "off", g_sub.count, g_sub.count * g_cfg.blockMB, g_sub.usedPages * SUB_PAGE / 1048576.0,
-                g_sub.live, g_sub.made, g_sub.fellBack, g_sub.heapFails);
+        if (g_sub.tierOk)
+        {
+            char sum[256];
+            SubSummary(sum, sizeof(sum));
+            Log("SUB fix %s | %s | %ld live, %ld made, %ld fell back (%ld at a pool cap), %ld block failures",
+                g_sub.on ? "on" : "off", sum, g_sub.live, g_sub.made, g_sub.fellBack, g_sub.capped, g_sub.heapFails);
+        }
         LONGLONG keepLast = g_stats.last;
         g_stats = Stats();
         g_stats.last = keepLast; g_stats.windowStart = now;
@@ -1327,9 +1482,11 @@ static DWORD WINAPI KeyThread(LPVOID)
             {
                 LONG now = !g_sub.on;
                 InterlockedExchange(&g_sub.on, now);
-                Log("FIX: suballocation switched %s by the player | %d blocks, %.1f MB in use, %ld live, %ld made, %ld fell back",
-                    now ? "ON" : "OFF", g_sub.count, g_sub.usedPages * SUB_PAGE / 1048576.0,
-                    g_sub.live, g_sub.made, g_sub.fellBack);
+                char sum[256];
+                SubSummary(sum, sizeof(sum));
+                Log("FIX: suballocation switched %s by the player | %s | %ld live, %ld made, %ld fell back",
+                    now ? "ON" : "OFF", sum, g_sub.live, g_sub.made, g_sub.fellBack);
+                if (now && g_sub.growEvent) SetEvent(g_sub.growEvent);
             }
         }
         tWas = tDown;
@@ -1382,9 +1539,10 @@ static DWORD WINAPI InitThread(LPVOID)
                            : "config loaded from ishimurapatch.ini");
     Log("config: Logging = %d | HitchMs = %d | CaptureKey = %s", g_cfg.logging, g_cfg.hitchMs,
         g_cfg.captureKey[0] ? g_cfg.captureKey : "(off)");
-    Log("config: Suballocate = %d | ToggleKey = %s | BlockMB = %d | PrewarmBlocks = %d | MaxResourceKB = %d",
-        g_cfg.suballocate, g_cfg.toggleKey[0] ? g_cfg.toggleKey : "(off)", g_cfg.blockMB,
-        g_cfg.prewarmBlocks, g_cfg.maxResourceKB);
+    Log("config: Suballocate = %d | ToggleKey = %s | BlockMB = %d | PrewarmBlocks = %d | MaxPoolMB = %d | MaxResourceKB = %d"
+        " | HostBlockMB = %d | MaxHostPoolMB = %d",
+        g_cfg.suballocate, g_cfg.toggleKey[0] ? g_cfg.toggleKey : "(off)", g_cfg.blockMB, g_cfg.prewarmBlocks,
+        g_cfg.maxPoolMB, g_cfg.maxResourceKB, g_cfg.hostBlockMB, g_cfg.maxHostPoolMB);
     {
         char exe[MAX_PATH] = {};
         GetModuleFileNameA(NULL, exe, MAX_PATH);
