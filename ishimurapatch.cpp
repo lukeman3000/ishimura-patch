@@ -103,6 +103,7 @@ struct Config
     int  dataReadMBs = 0;
     int  maxFps = 0;
     int  raiseDirectQueue = 0;
+    int  raiseCopyQueue = 0;
     struct { char cls[96], fld[96], val[64]; } engine[16];   // [Engine] Class.Field = value
     int  nEngine = 0;
 };
@@ -245,6 +246,12 @@ static const char* DEFAULT_INI =
 "; 0 = off (default), 1 = on\n"
 "RaiseDirectQueue = 0\n"
 "\n"
+"; DEVELOPMENT (read at launch). Create the game's copy queue at high\n"
+"; priority. At a streaming boundary it uploads the new area's data while\n"
+"; the graphics queue waits on those uploads, so finishing them sooner may\n"
+"; mean less waiting. An experiment. 0 = off (default), 1 = on\n"
+"RaiseCopyQueue = 0\n"
+"\n"
 "; DEVELOPMENT (read at launch). Runs ishimurapatch_probe.dll (beside this\n"
 "; file) once each time it changes, from 20 seconds after the game starts:\n"
 "; reverse-engineering code that is rebuilt while the game runs. Without\n"
@@ -296,6 +303,7 @@ static void ReadConfig(Config& c, const Config& fb)
     GetPrivateProfileStringA("Advanced", "CaptureKey", fb.captureKey, c.captureKey, sizeof(c.captureKey), ini);
     c.probe   = GetPrivateProfileIntA("Advanced", "Probe", fb.probe, ini) ? 1 : 0;
     c.raiseDirectQueue = GetPrivateProfileIntA("Advanced", "RaiseDirectQueue", fb.raiseDirectQueue, ini) ? 1 : 0;
+    c.raiseCopyQueue   = GetPrivateProfileIntA("Advanced", "RaiseCopyQueue", fb.raiseCopyQueue, ini) ? 1 : 0;
 
     if (c.logging < 0 || c.logging > 2) c.logging = fb.logging;
     if (c.hitchMs < 1) c.hitchMs = fb.hitchMs;
@@ -1932,13 +1940,18 @@ static void NoteQueue(const D3D12_COMMAND_QUEUE_DESC* d, void* q)
     HookQueueMethods(q);
 }
 
-// [Advanced] RaiseDirectQueue = 1 creates the game's DIRECT (graphics) queues
-// at HIGH priority, so the GPU favours drawing the frame over other queues'
-// work (an experiment; priority is fixed when a queue is created).
+// [Advanced] RaiseDirectQueue / RaiseCopyQueue = 1 create the game's DIRECT
+// (graphics) / COPY queues at HIGH priority (experiments; priority is fixed
+// when a queue is created). The QUEUES lines at the lift (10/19): at the
+// boundary the copy queue goes from 0 to 60-160 submissions a second and the
+// graphics queue's GPU-side waits rise by about one per upload, so a faster
+// copy queue may mean less waiting for the frame.
 static const D3D12_COMMAND_QUEUE_DESC* QueueDesc(const D3D12_COMMAND_QUEUE_DESC* d, D3D12_COMMAND_QUEUE_DESC& copy)
 {
-    if (!g_cfg.raiseDirectQueue || !d || d->Type != D3D12_COMMAND_LIST_TYPE_DIRECT ||
-        d->Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL) return d;
+    if (!d || d->Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL) return d;
+    bool raise = (d->Type == D3D12_COMMAND_LIST_TYPE_DIRECT && g_cfg.raiseDirectQueue) ||
+                 (d->Type == D3D12_COMMAND_LIST_TYPE_COPY && g_cfg.raiseCopyQueue);
+    if (!raise) return d;
     copy = *d;
     copy.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
     return &copy;
@@ -2456,6 +2469,7 @@ static DWORD WINAPI InitThread(LPVOID)
         g_cfg.maxPoolMB, g_cfg.maxResourceKB, g_cfg.hostBlockMB, g_cfg.maxHostPoolMB);
     Log("config: MaxFps = %d | Reflex = %d | DataReadMBs = %d | RaiseDirectQueue = %d", g_cfg.maxFps, g_cfg.reflex,
         g_cfg.dataReadMBs, g_cfg.raiseDirectQueue);
+    Log("config: RaiseCopyQueue = %d", g_cfg.raiseCopyQueue);
     Log("config: Probe = %d | [Engine] %d setting%s", g_cfg.probe, g_cfg.nEngine, g_cfg.nEngine == 1 ? "" : "s");
     for (int i = 0; i < g_cfg.nEngine; ++i)
         Log("config:   %s.%s = %s", g_cfg.engine[i].cls, g_cfg.engine[i].fld, g_cfg.engine[i].val);
