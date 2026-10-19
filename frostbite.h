@@ -230,7 +230,20 @@ struct SettingRef
     int   k, width;
     UINT16 off;
     BYTE  bytes[4];
+    BYTE  orig[4][4];   // each object's value before our first write
+    bool  haveOrig[4];  // (what PutBackSetting restores)
 };
+
+// r.val encoded as r.type into r.bytes; false for a type not written.
+static bool EncodeSetting(SettingRef& r)
+{
+    if (!strcmp(r.type, "Boolean"))      { r.bytes[0] = (BYTE)(atoi(r.val) != 0); r.width = 1; }
+    else if (!strcmp(r.type, "Uint32"))  { UINT32 v = (UINT32)strtoul(r.val, NULL, 10); memcpy(r.bytes, &v, 4); r.width = 4; }
+    else if (!strcmp(r.type, "Int32"))   { INT32 v = (INT32)strtol(r.val, NULL, 10); memcpy(r.bytes, &v, 4); r.width = 4; }
+    else if (!strcmp(r.type, "Float32")) { float v = (float)atof(r.val); memcpy(r.bytes, &v, 4); r.width = 4; }
+    else return false;
+    return true;
+}
 
 static bool ResolveSetting(SettingRef& r, const char* tag, bool quiet = false)
 {
@@ -247,21 +260,18 @@ static bool ResolveSetting(SettingRef& r, const char* tag, bool quiet = false)
     if (!fd) { Log("%s: %s.%s - no such field%s", tag, r.cls, r.fld, rec ? "" : " (class record NOT FOUND)"); return false; }
     TypeName(fd->type, r.type, sizeof(r.type));
     r.off = fd->off;
-    if (!strcmp(r.type, "Boolean"))      { r.bytes[0] = (BYTE)(atoi(r.val) != 0); r.width = 1; }
-    else if (!strcmp(r.type, "Uint32"))  { UINT32 v = (UINT32)strtoul(r.val, NULL, 10); memcpy(r.bytes, &v, 4); r.width = 4; }
-    else if (!strcmp(r.type, "Int32"))   { INT32 v = (INT32)strtol(r.val, NULL, 10); memcpy(r.bytes, &v, 4); r.width = 4; }
-    else if (!strcmp(r.type, "Float32")) { float v = (float)atof(r.val); memcpy(r.bytes, &v, 4); r.width = 4; }
-    else { Log("%s: %s.%s is a %s - not written", tag, r.cls, r.fld, r.type[0] ? r.type : "type of unknown name"); return false; }
+    if (!EncodeSetting(r)) { Log("%s: %s.%s is a %s - not written", tag, r.cls, r.fld, r.type[0] ? r.type : "type of unknown name"); return false; }
     r.k = FindObjects(*sh, r.objs, 4);
+    memset(r.haveOrig, 0, sizeof(r.haveOrig));
     if (!r.k) { if (!quiet) Log("%s: %s.%s - no live object found", tag, r.cls, r.fld); return false; }
     return true;
 }
 
-static void LogValue(const char* tag, const SettingRef& r, int j, const BYTE* old)
+static void LogValue(const char* tag, const SettingRef& r, int j, const BYTE* old, const BYTE* now)
 {
-    if (r.width == 1) Log("%s: %s.%s (%s) @ %p: %u -> %u", tag, r.cls, r.fld, r.type, r.objs[j], old[0], r.bytes[0]);
-    else if (!strcmp(r.type, "Float32")) Log("%s: %s.%s (%s) @ %p: %g -> %g", tag, r.cls, r.fld, r.type, r.objs[j], *(const float*)old, *(const float*)r.bytes);
-    else Log("%s: %s.%s (%s) @ %p: %d -> %d", tag, r.cls, r.fld, r.type, r.objs[j], *(const INT32*)old, *(const INT32*)r.bytes);
+    if (r.width == 1) Log("%s: %s.%s (%s) @ %p: %u -> %u", tag, r.cls, r.fld, r.type, r.objs[j], old[0], now[0]);
+    else if (!strcmp(r.type, "Float32")) Log("%s: %s.%s (%s) @ %p: %g -> %g", tag, r.cls, r.fld, r.type, r.objs[j], *(const float*)old, *(const float*)now);
+    else Log("%s: %s.%s (%s) @ %p: %d -> %d", tag, r.cls, r.fld, r.type, r.objs[j], *(const INT32*)old, *(const INT32*)now);
 }
 
 // Returns how many objects were written (already-correct ones are skipped);
@@ -276,8 +286,30 @@ static int ApplySetting(SettingRef& r, const char* tag)
         if (!memcmp(old, r.bytes, r.width)) continue;
         __try { memcpy(r.objs[j] + r.off, r.bytes, r.width); }
         __except (EXCEPTION_EXECUTE_HANDLER) { Log("%s: %s.%s write FAILED @ %p", tag, r.cls, r.fld, r.objs[j]); return -1; }
-        LogValue(tag, r, j, old);
+        if (!r.haveOrig[j]) { memcpy(r.orig[j], old, 4); r.haveOrig[j] = true; }
+        LogValue(tag, r, j, old, r.bytes);
         ++done;
+    }
+    return done;
+}
+
+// Writes back each object's value from before our first write (a line taken
+// out of [Engine] live). Returns how many were written.
+static int PutBackSetting(SettingRef& r, const char* tag)
+{
+    int done = 0;
+    for (int j = 0; j < r.k; ++j)
+    {
+        BYTE old[4] = {};
+        if (!r.haveOrig[j] || !SafeRead(r.objs[j] + r.off, old, r.width)) continue;
+        if (memcmp(old, r.orig[j], r.width))
+        {
+            __try { memcpy(r.objs[j] + r.off, r.orig[j], r.width); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+            LogValue(tag, r, j, old, r.orig[j]);
+            ++done;
+        }
+        r.haveOrig[j] = false;
     }
     return done;
 }

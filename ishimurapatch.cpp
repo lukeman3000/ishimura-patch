@@ -62,7 +62,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "version.lib")
 
-static const char* MOD_VERSION = "0.3.0";
+static const char* MOD_VERSION = "0.3.1";
 
 extern "C" {
 extern const int VT_GetResourceAllocationInfo, VT_CreateCommittedResource, VT_CreateHeap,
@@ -104,23 +104,87 @@ struct Config
 static Config g_cfg;
 
 static const char* DEFAULT_INI =
-"; Ishimura Patch - Dead Space (2023)\n"
+"; ============================================================================\n"
+";  Dead Space (2023) Ishimura Patch - configuration\n"
 ";\n"
-"; Fixes the traversal stutter at streaming boundaries (walking off a lift,\n"
-"; through doors, down hallways). Two parts, both on by default: [Fix]\n"
-"; changes how the game's small GPU memory requests are made, and [Engine]\n"
-"; sets one of the engine's own texture streaming options. Nothing on disk\n"
-"; is changed. Delete this file and relaunch to get the defaults back.\n"
+";  Fixes the traversal stutter at streaming boundaries (walking off a lift,\n"
+";  through doors, down hallways). Nothing on disk is changed.\n"
+";\n"
+";  Every setting here is optional. If you run into problems, delete this\n"
+";  file and it will be recreated with defaults on the next launch.\n"
+";\n"
+";  Edit with any text editor. Changes take effect within about a second\n"
+";  of saving - even while the game is running - except the settings marked\n"
+";  (read at launch). Check ishimurapatch.log (same folder) to confirm what\n"
+";  was applied.\n"
+"; ============================================================================\n"
 "\n"
-"[Logging]\n"
+"; ============================================================================\n"
+";  FIXES\n"
+"; ============================================================================\n"
+"\n"
+"[Fix]\n"
+"\n"
+"; Most of the stutter comes from the game asking Windows for hundreds of\n"
+"; small GPU memory blocks in one frame, each one a slow round trip. With\n"
+"; this on, those small textures and buffers are carved out of a few large\n"
+"; blocks made in advance instead. (Lift test: worst frame ~106 -> ~18 ms.)\n"
+"; Switching it applies to textures made from then on.\n"
+"; 1 = fixed (default), 0 = stock game behavior\n"
+"Suballocate = 1\n"
+"\n"
+"; Press this key while playing to switch Suballocate on or off (logged),\n"
+"; for comparing the two in one session. F1-F12 or a letter; empty = off.\n"
+"ToggleKey = F9\n"
+"\n"
+"; (read at launch) The large blocks in graphics memory: their size (MB,\n"
+"; 16-256), how many are made when the game starts (0-16; more are added\n"
+"; in the background before they're needed), and the most they may total\n"
+"; (MB, 256-16384). At that limit, further requests are left as the game\n"
+"; made them, so this caps the extra graphics memory the fix can hold.\n"
+"BlockMB = 128\n"
+"PrewarmBlocks = 4\n"
+"MaxPoolMB = 4096\n"
+"\n"
+"; (read at launch) The largest single resource carved out of a block (KB,\n"
+"; 64-16384; never more than half a block). Larger ones stay as the game\n"
+"; made them.\n"
+"MaxResourceKB = 16384\n"
+"\n"
+"; (read at launch) The same for the small buffers the CPU and GPU pass\n"
+"; data through (system memory, not graphics memory): block size (MB,\n"
+"; 4-64) and the most they may total (MB, 16-2048).\n"
+"HostBlockMB = 32\n"
+"MaxHostPoolMB = 512\n"
+"\n"
+"\n"
+"; ============================================================================\n"
+";  ENGINE SETTINGS - the game's own options, set in the running game\n"
+"; ============================================================================\n"
+"\n"
+"[Engine]\n"
+"\n"
+"; Written into the running game a few seconds after it starts, and kept\n"
+"; that way (logged). One per line, as Class.Field = value. Delete a line,\n"
+"; or put ; in front of it, and the game's own value is put back.\n"
+";\n"
+"; ForceLoadStreamingImmediate: the game normally stops a frame to finish\n"
+"; loading a texture it needs right now. Off, the frame goes on with a\n"
+"; slightly lower-detail version for a few frames until the sharp one is\n"
+"; in. With [Fix] on this takes the lift test's worst frame ~18 -> ~12 ms.\n"
+"TextureStreamingSettings.ForceLoadStreamingImmediate = 0\n"
+"\n"
+"\n"
+"[Advanced]\n"
+"\n"
 "; Write a log to ishimurapatch.log (a fresh file every launch; a session's\n"
 "; log stops at 256 MB)\n"
 ";  0 = off\n"
 ";  1 = on (default): what was hooked, one HITCH line for every frame at\n"
 ";      least HitchMs long, and a STATS line every 30 seconds\n"
-";  2 = verbose: also every GPU memory request and every frame, stamped in\n"
-";      ms since the game started. Roughly 10-15 MB a minute; only worth\n"
-";      turning on for a test run.\n"
+";  2 = verbose (read at launch): also every GPU memory request and every\n"
+";      frame, stamped in ms since the game started. Roughly 10-15 MB a\n"
+";      minute; only worth turning on for a test run.\n"
 "Logging = 1\n"
 "\n"
 "; A frame at least this long (ms) gets a HITCH line.\n"
@@ -133,58 +197,65 @@ static const char* DEFAULT_INI =
 "; letter; empty = off.\n"
 "CaptureKey = F8\n"
 "\n"
-"[Fix]\n"
-"; Most of the stutter comes from the game asking Windows for hundreds of\n"
-"; small GPU memory blocks in one frame, each one a slow round trip. With\n"
-"; this on, those small textures and buffers are carved out of a few large\n"
-"; blocks made in advance instead. (Lift test: worst frame ~106 -> ~18 ms.)\n"
-";  0 = off (the game as shipped)\n"
-";  1 = on (default)\n"
-"Suballocate = 1\n"
-"\n"
-"; Press this key while playing to switch Suballocate on or off (logged),\n"
-"; for comparing the two in one session. It applies to resources created\n"
-"; from then on. F1-F12 or a letter; empty = off.\n"
-"ToggleKey = F9\n"
-"\n"
-"; The large blocks in graphics memory: their size (MB, 16-256), how many\n"
-"; are made when the game starts (0-16; more are added in the background\n"
-"; before they're needed), and the most they may total (MB, 256-16384).\n"
-"; At that limit, further requests are left as the game made them, so\n"
-"; this caps the extra graphics memory the fix can hold.\n"
-"BlockMB = 128\n"
-"PrewarmBlocks = 4\n"
-"MaxPoolMB = 4096\n"
-"\n"
-"; The largest single resource carved out of a block (KB, 64-16384; never\n"
-"; more than half a block). Larger ones stay as the game made them.\n"
-"MaxResourceKB = 16384\n"
-"\n"
-"; The same for the small buffers the CPU and GPU pass data through\n"
-"; (system memory, not graphics memory): block size (MB, 4-64) and the\n"
-"; most they may total (MB, 16-2048).\n"
-"HostBlockMB = 32\n"
-"MaxHostPoolMB = 512\n"
-"\n"
-"[Engine]\n"
-"; The engine's own settings, written into the running game a few seconds\n"
-"; after it starts and kept that way (logged). One per line, as\n"
-"; Class.Field = value. Delete a line, or put ; in front of it, to leave\n"
-"; that setting as the game has it.\n"
-";\n"
-"; ForceLoadStreamingImmediate: the game normally stops a frame to finish\n"
-"; loading a texture it needs right now. Off, the frame goes on with a\n"
-"; slightly lower-detail version for a few frames until the sharp one is\n"
-"; in. With [Fix] on this takes the lift test's worst frame ~18 -> ~12 ms.\n"
-"TextureStreamingSettings.ForceLoadStreamingImmediate = 0\n"
-"\n"
-"[Settings]\n"
-"; DEVELOPMENT. Runs ishimurapatch_probe.dll (beside this file) once each\n"
-"; time it changes, from 20 seconds after the game starts: reverse-\n"
-"; engineering code that is rebuilt while the game runs. Without the file\n"
-"; this does nothing.\n"
-";  0 = off (default)   1 = on\n"
+"; DEVELOPMENT (read at launch). Runs ishimurapatch_probe.dll (beside this\n"
+"; file) once each time it changes, from 20 seconds after the game starts:\n"
+"; reverse-engineering code that is rebuilt while the game runs. Without\n"
+"; the file this does nothing.\n"
+"; 0 = off (default), 1 = on\n"
 "Probe = 0\n";
+
+// One reader for boot and live (the Mouse Fix rule). Every key falls back to
+// `fb` when it is missing: boot passes the declared defaults (a fresh
+// Config); live passes the same defaults except Logging, which keeps its
+// last value so a deleted Logging line can't silence a session's log. `c`
+// and `fb` must be different objects. Ranges are checked here, for both.
+static void ReadConfig(Config& c, const Config& fb)
+{
+    const char* ini = g_files.iniPath;
+    c.suballocate   = GetPrivateProfileIntA("Fix", "Suballocate", fb.suballocate, ini) ? 1 : 0;
+    GetPrivateProfileStringA("Fix", "ToggleKey", fb.toggleKey, c.toggleKey, sizeof(c.toggleKey), ini);
+    c.blockMB       = GetPrivateProfileIntA("Fix", "BlockMB", fb.blockMB, ini);
+    c.prewarmBlocks = GetPrivateProfileIntA("Fix", "PrewarmBlocks", fb.prewarmBlocks, ini);
+    c.maxPoolMB     = GetPrivateProfileIntA("Fix", "MaxPoolMB", fb.maxPoolMB, ini);
+    c.maxResourceKB = GetPrivateProfileIntA("Fix", "MaxResourceKB", fb.maxResourceKB, ini);
+    c.hostBlockMB   = GetPrivateProfileIntA("Fix", "HostBlockMB", fb.hostBlockMB, ini);
+    c.maxHostPoolMB = GetPrivateProfileIntA("Fix", "MaxHostPoolMB", fb.maxHostPoolMB, ini);
+    {
+        // [Engine]: every "Class.Field = value" line
+        static char sec[8192];
+        DWORD len = GetPrivateProfileSectionA("Engine", sec, sizeof(sec), ini);
+        c.nEngine = 0;
+        for (char* p = sec; len && *p && c.nEngine < 16; p += strlen(p) + 1)
+        {
+            if (*p == ';' || *p == '#') continue;
+            auto& e = c.engine[c.nEngine];
+            char key[200] = {};
+            if (sscanf_s(p, " %199[^=] = %63s", key, (unsigned)sizeof(key), e.val, (unsigned)sizeof(e.val)) != 2) continue;
+            for (char* k = key + strlen(key); k > key && (k[-1] == ' ' || k[-1] == '\t'); ) *--k = 0;
+            char* dot = strchr(key, '.');
+            if (!dot) continue;
+            *dot = 0;
+            strncpy_s(e.cls, sizeof(e.cls), key, _TRUNCATE);
+            strncpy_s(e.fld, sizeof(e.fld), dot + 1, _TRUNCATE);
+            c.nEngine++;
+        }
+    }
+    c.logging = GetPrivateProfileIntA("Advanced", "Logging", fb.logging, ini);
+    c.hitchMs = GetPrivateProfileIntA("Advanced", "HitchMs", fb.hitchMs, ini);
+    GetPrivateProfileStringA("Advanced", "CaptureKey", fb.captureKey, c.captureKey, sizeof(c.captureKey), ini);
+    c.probe   = GetPrivateProfileIntA("Advanced", "Probe", fb.probe, ini) ? 1 : 0;
+
+    if (c.logging < 0 || c.logging > 2) c.logging = fb.logging;
+    if (c.hitchMs < 1) c.hitchMs = fb.hitchMs;
+    if (c.blockMB < 16 || c.blockMB > 256) c.blockMB = fb.blockMB;
+    if (c.prewarmBlocks < 0 || c.prewarmBlocks > 16) c.prewarmBlocks = fb.prewarmBlocks;
+    if (c.maxResourceKB < 64 || c.maxResourceKB > 16384) c.maxResourceKB = fb.maxResourceKB;
+    if (c.maxPoolMB < 256 || c.maxPoolMB > 16384) c.maxPoolMB = fb.maxPoolMB;
+    if (c.maxPoolMB < c.blockMB) c.maxPoolMB = c.blockMB;
+    if (c.hostBlockMB < 4 || c.hostBlockMB > 64) c.hostBlockMB = fb.hostBlockMB;
+    if (c.maxHostPoolMB < 16 || c.maxHostPoolMB > 2048) c.maxHostPoolMB = fb.maxHostPoolMB;
+    if (c.maxHostPoolMB < c.hostBlockMB) c.maxHostPoolMB = c.hostBlockMB;
+}
 
 static void LoadConfig()
 {
@@ -206,51 +277,7 @@ static void LoadConfig()
             g_files.iniCreated = true;
         }
     }
-    Config fb;
-    g_cfg.logging = GetPrivateProfileIntA("Logging", "Logging", fb.logging, g_files.iniPath);
-    g_cfg.hitchMs = GetPrivateProfileIntA("Logging", "HitchMs", fb.hitchMs, g_files.iniPath);
-    GetPrivateProfileStringA("Logging", "CaptureKey", fb.captureKey, g_cfg.captureKey,
-                             sizeof(g_cfg.captureKey), g_files.iniPath);
-    g_cfg.suballocate   = GetPrivateProfileIntA("Fix", "Suballocate", fb.suballocate, g_files.iniPath);
-    GetPrivateProfileStringA("Fix", "ToggleKey", fb.toggleKey, g_cfg.toggleKey, sizeof(g_cfg.toggleKey), g_files.iniPath);
-    g_cfg.blockMB       = GetPrivateProfileIntA("Fix", "BlockMB", fb.blockMB, g_files.iniPath);
-    g_cfg.prewarmBlocks = GetPrivateProfileIntA("Fix", "PrewarmBlocks", fb.prewarmBlocks, g_files.iniPath);
-    g_cfg.maxResourceKB = GetPrivateProfileIntA("Fix", "MaxResourceKB", fb.maxResourceKB, g_files.iniPath);
-    g_cfg.maxPoolMB     = GetPrivateProfileIntA("Fix", "MaxPoolMB", fb.maxPoolMB, g_files.iniPath);
-    g_cfg.hostBlockMB   = GetPrivateProfileIntA("Fix", "HostBlockMB", fb.hostBlockMB, g_files.iniPath);
-    g_cfg.maxHostPoolMB = GetPrivateProfileIntA("Fix", "MaxHostPoolMB", fb.maxHostPoolMB, g_files.iniPath);
-    g_cfg.probe         = GetPrivateProfileIntA("Settings", "Probe", fb.probe, g_files.iniPath) ? 1 : 0;
-    {
-        // [Engine]: every "Class.Field = value" line
-        static char sec[8192];
-        DWORD len = GetPrivateProfileSectionA("Engine", sec, sizeof(sec), g_files.iniPath);
-        g_cfg.nEngine = 0;
-        for (char* p = sec; len && *p && g_cfg.nEngine < 16; p += strlen(p) + 1)
-        {
-            if (*p == ';' || *p == '#') continue;
-            auto& e = g_cfg.engine[g_cfg.nEngine];
-            char key[200] = {};
-            if (sscanf_s(p, " %199[^=] = %63s", key, (unsigned)sizeof(key), e.val, (unsigned)sizeof(e.val)) != 2) continue;
-            for (char* k = key + strlen(key); k > key && (k[-1] == ' ' || k[-1] == '\t'); ) *--k = 0;
-            char* dot = strchr(key, '.');
-            if (!dot) continue;
-            *dot = 0;
-            strncpy_s(e.cls, sizeof(e.cls), key, _TRUNCATE);
-            strncpy_s(e.fld, sizeof(e.fld), dot + 1, _TRUNCATE);
-            g_cfg.nEngine++;
-        }
-    }
-    if (g_cfg.logging < 0 || g_cfg.logging > 2) g_cfg.logging = 1;
-    if (g_cfg.hitchMs < 1) g_cfg.hitchMs = fb.hitchMs;
-    g_cfg.suballocate = g_cfg.suballocate ? 1 : 0;
-    if (g_cfg.blockMB < 16 || g_cfg.blockMB > 256) g_cfg.blockMB = fb.blockMB;
-    if (g_cfg.prewarmBlocks < 0 || g_cfg.prewarmBlocks > 16) g_cfg.prewarmBlocks = fb.prewarmBlocks;
-    if (g_cfg.maxResourceKB < 64 || g_cfg.maxResourceKB > 16384) g_cfg.maxResourceKB = fb.maxResourceKB;
-    if (g_cfg.maxPoolMB < 256 || g_cfg.maxPoolMB > 16384) g_cfg.maxPoolMB = fb.maxPoolMB;
-    if (g_cfg.maxPoolMB < g_cfg.blockMB) g_cfg.maxPoolMB = g_cfg.blockMB;
-    if (g_cfg.hostBlockMB < 4 || g_cfg.hostBlockMB > 64) g_cfg.hostBlockMB = fb.hostBlockMB;
-    if (g_cfg.maxHostPoolMB < 16 || g_cfg.maxHostPoolMB > 2048) g_cfg.maxHostPoolMB = fb.maxHostPoolMB;
-    if (g_cfg.maxHostPoolMB < g_cfg.hostBlockMB) g_cfg.maxHostPoolMB = g_cfg.hostBlockMB;
+    ReadConfig(g_cfg, Config());    // every key; a missing one = its default
 }
 
 // ----------------------------------------------------------------------------
@@ -1263,56 +1290,127 @@ static DWORD WINAPI PresentHookThread(LPVOID param)
 // the live objects by shape) and written, retrying for two minutes while the
 // objects appear. Then every 2 s each is checked and restored if the engine
 // changed it back (logged; a setting restored 50 times is given up on).
+// The list is live: a saved ini adds, changes or takes out settings within a
+// second, and a setting taken out gets the game's own value back (each
+// object's value from before our first write).
 // Lift A/B, 10/18: with [Fix] on, ForceLoadStreamingImmediate = 0 took the
 // worst frame per pass from 14.5-20.5 ms to 11.5-12.5 ms over five passes
 // each; a 1 ms ForceLoadStreamingImmediateQuantumMs instead spiked to 22.9,
 // and splitting mesh streaming work over 4 frames made no real difference.
 // ----------------------------------------------------------------------------
 static bool DeviceReady();   // the game's D3D12 device has been found (below)
+
+// The [Engine] list lives in g_cfg; a live reload replaces it under this
+// section and raises the flag, and EngineThread works out what changed.
+static LazyCs        g_engineCs;
+static volatile LONG g_engineDirty = 1;     // the boot list counts as a change
+static HANDLE        g_engineWake = NULL;   // set by a reload, so it's seen at once
+
+struct EngineSlot
+{
+    SettingRef r;
+    bool resolved;
+    int  tries, restored;
+    int  addedTick;
+};
+
+static bool SameSetting(const SettingRef& r, const char* cls, const char* fld)
+{
+    return !strcmp(r.cls, cls) && !strcmp(r.fld, fld);
+}
+
 static DWORD WINAPI EngineThread(LPVOID)
 {
-    static SettingRef refs[16];
-    static int restored[16];
-    bool ok[16] = {};
-    for (int i = 0; i < g_cfg.nEngine; ++i)
-    {
-        refs[i] = SettingRef();
-        strncpy_s(refs[i].cls, sizeof(refs[i].cls), g_cfg.engine[i].cls, _TRUNCATE);
-        strncpy_s(refs[i].fld, sizeof(refs[i].fld), g_cfg.engine[i].fld, _TRUNCATE);
-        strncpy_s(refs[i].val, sizeof(refs[i].val), g_cfg.engine[i].val, _TRUNCATE);
-    }
+    static EngineSlot slots[16], next[16];
+    int n = 0;
     for (int w = 0; w < 600 && !DeviceReady(); ++w) Sleep(100);
     Sleep(5000);
     ImgInit();
-    int left = g_cfg.nEngine;
-    for (int attempt = 0; attempt < 24 && left; ++attempt, Sleep(5000))
-        for (int i = 0; i < g_cfg.nEngine; ++i)
+    for (int tick = 0;; ++tick)
+    {
+        if (InterlockedExchange(&g_engineDirty, 0))
         {
-            if (ok[i]) continue;
-            bool last = attempt == 23;
-            if (!ResolveSetting(refs[i], "ENGINE", !last)) continue;
-            ok[i] = true; --left;
-            int n = ApplySetting(refs[i], "ENGINE: set");
-            if (n == 0) Log("ENGINE: %s.%s already %s", refs[i].cls, refs[i].fld, refs[i].val);
-        }
-    for (int i = 0; i < g_cfg.nEngine; ++i)
-        if (!ok[i]) Log("ENGINE: %s.%s NOT applied (no live object found in 2 minutes) - the game keeps its own value",
-                        refs[i].cls, refs[i].fld);
-    if (left == g_cfg.nEngine) return 0;
-    for (;; Sleep(2000))
-        for (int i = 0; i < g_cfg.nEngine; ++i)
-        {
-            if (!ok[i] || restored[i] >= 50) continue;
-            int n = ApplySetting(refs[i], "ENGINE: restored");
-            if (n < 0)
+            decltype(g_cfg.engine) want;
+            EnsureCs(g_engineCs);
+            EnterCriticalSection(&g_engineCs.cs);
+            int nw = g_cfg.nEngine;
+            memcpy(want, g_cfg.engine, sizeof(want));
+            LeaveCriticalSection(&g_engineCs.cs);
+            bool taken[16] = {};
+            int nn = 0;
+            for (int i = 0; i < nw; ++i)
             {
-                Log("ENGINE: %s.%s object no longer readable - finding it again", refs[i].cls, refs[i].fld);
-                if (ResolveSetting(refs[i], "ENGINE")) ApplySetting(refs[i], "ENGINE: set");
+                EngineSlot& s = next[nn++];
+                int j = 0;
+                while (j < n && (taken[j] || !SameSetting(slots[j].r, want[i].cls, want[i].fld))) ++j;
+                if (j < n)
+                {
+                    // kept: a new value is written at once; objects and originals stay
+                    taken[j] = true;
+                    s = slots[j];
+                    if (strcmp(s.r.val, want[i].val))
+                    {
+                        strncpy_s(s.r.val, sizeof(s.r.val), want[i].val, _TRUNCATE);
+                        s.restored = 0;
+                        Log("ENGINE: %s.%s = %s (live)", s.r.cls, s.r.fld, s.r.val);
+                        if (s.resolved && EncodeSetting(s.r)) ApplySetting(s.r, "ENGINE: set");
+                    }
+                    continue;
+                }
+                s = EngineSlot();
+                strncpy_s(s.r.cls, sizeof(s.r.cls), want[i].cls, _TRUNCATE);
+                strncpy_s(s.r.fld, sizeof(s.r.fld), want[i].fld, _TRUNCATE);
+                strncpy_s(s.r.val, sizeof(s.r.val), want[i].val, _TRUNCATE);
+                s.addedTick = tick;
+                if (tick) Log("ENGINE: %s.%s = %s added (live)", s.r.cls, s.r.fld, s.r.val);
+            }
+            for (int j = 0; j < n; ++j)
+            {
+                if (taken[j]) continue;
+                bool ours = false;
+                for (int o = 0; o < slots[j].r.k; ++o) ours |= slots[j].r.haveOrig[o];
+                Log("ENGINE: %s.%s taken out (live)%s", slots[j].r.cls, slots[j].r.fld,
+                    ours ? " - the game's own value goes back" : " - it was never changed");
+                if (ours) PutBackSetting(slots[j].r, "ENGINE: put back");
+            }
+            memcpy(slots, next, sizeof(slots));
+            n = nn;
+        }
+        for (int i = 0; i < n; ++i)
+        {
+            EngineSlot& s = slots[i];
+            int age = tick - s.addedTick;
+            if (!s.resolved)
+            {
+                // objects can appear late: every 5 s for two minutes
+                if (s.tries >= 24 || age % 5) continue;
+                bool last = ++s.tries == 24;
+                if (ResolveSetting(s.r, "ENGINE", !last))
+                {
+                    s.resolved = true;
+                    if (ApplySetting(s.r, "ENGINE: set") == 0) Log("ENGINE: %s.%s already %s", s.r.cls, s.r.fld, s.r.val);
+                }
+                else if (last || !s.r.width)   // !width: no such class, field or writable type
+                {
+                    s.tries = 24;
+                    Log("ENGINE: %s.%s NOT applied - the game keeps its own value", s.r.cls, s.r.fld);
+                }
                 continue;
             }
-            if (n > 0 && ++restored[i] >= 50)
-                Log("ENGINE: %s.%s keeps being reset by the game - no longer enforced", refs[i].cls, refs[i].fld);
+            // kept: the engine may write its own value back
+            if (age % 2 || s.restored >= 50) continue;
+            int done = ApplySetting(s.r, "ENGINE: restored");
+            if (done < 0)
+            {
+                Log("ENGINE: %s.%s object no longer readable - finding it again", s.r.cls, s.r.fld);
+                if (ResolveSetting(s.r, "ENGINE")) ApplySetting(s.r, "ENGINE: set");
+                continue;
+            }
+            if (done > 0 && ++s.restored >= 50)
+                Log("ENGINE: %s.%s keeps being reset by the game - no longer enforced", s.r.cls, s.r.fld);
         }
+        WaitForSingleObject(g_engineWake, 1000);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1320,7 +1418,7 @@ static DWORD WINAPI EngineThread(LPVOID)
 // reverse-engineering code that changes often (now: the settings inspector,
 // see probe.cpp). This thread watches the file; each new version is copied
 // to %TEMP%, loaded, run once (ProbeRun) and unloaded, so a probe runs in
-// the live game without a restart. [Settings] Probe = 1 turns it on.
+// the live game without a restart. [Advanced] Probe = 1 turns it on.
 // ----------------------------------------------------------------------------
 struct ProbeApi
 {
@@ -1624,16 +1722,16 @@ static DWORD WINAPI CaptureLog(LPVOID param)
     return 0;
 }
 
-// The capture key (Logging 2) and the fix's toggle key (any level).
+// The capture key (Logging 2) and the fix's toggle key (any level). Both are
+// looked up again each poll, so a live reload changes them.
 static DWORD WINAPI KeyThread(LPVOID)
 {
-    WORD vk = (g_cfg.logging == 2 && g_ring) ? KeyVk(g_cfg.captureKey) : 0;
-    WORD tk = KeyVk(g_cfg.toggleKey);
-    if (!vk && !tk) return 0;
     bool was = false, tWas = false;
     for (;;)
     {
         Sleep(30);
+        WORD vk = (g_cfg.logging == 2 && g_ring) ? KeyVk(g_cfg.captureKey) : 0;
+        WORD tk = KeyVk(g_cfg.toggleKey);
         bool tDown = tk && (GetAsyncKeyState(tk) & 0x8000) != 0;
         if (tDown && !tWas && GameHasFocus())
         {
@@ -1663,6 +1761,125 @@ static DWORD WINAPI KeyThread(LPVOID)
             else InterlockedExchange(&g_captureBusy, 0);
         }
         was = down;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// LIVE CONFIG RELOAD (the Mouse Fix design). Live: Suballocate, ToggleKey,
+// [Engine], Logging 0/1, HitchMs, CaptureKey. Read at launch (a change is
+// logged as waiting for the next launch): the pool sizes, which are made
+// once the device exists, Logging 2, whose ring is allocated at init, and
+// Probe, a thread started at init.
+// ----------------------------------------------------------------------------
+static void LoadConfigLive()
+{
+    Config c;
+    {   // the same reader as boot; only Logging keeps its last value
+        Config fb; fb.logging = g_cfg.logging;
+        ReadConfig(c, fb);
+    }
+    if (c.logging == 2 && !g_ring) { if (g_cfg.logging != 2) Log("config: Logging = 2 takes effect next launch"); c.logging = g_cfg.logging; }
+    if (c.logging != g_cfg.logging)
+    {
+        if (!c.logging) Log("config: Logging = 0 (live) - the log stops here");
+        g_cfg.logging = c.logging;
+        Log("config: Logging = %d (live)", g_cfg.logging);
+    }
+    if (c.hitchMs != g_cfg.hitchMs) { g_cfg.hitchMs = c.hitchMs; Log("config: HitchMs = %d (live)", g_cfg.hitchMs); }
+    if (strcmp(c.captureKey, g_cfg.captureKey))
+    {
+        strcpy_s(g_cfg.captureKey, sizeof(g_cfg.captureKey), c.captureKey);
+        Log("config: CaptureKey = %s (live)", g_cfg.captureKey[0] ? g_cfg.captureKey : "(off)");
+    }
+    if (strcmp(c.toggleKey, g_cfg.toggleKey))
+    {
+        strcpy_s(g_cfg.toggleKey, sizeof(g_cfg.toggleKey), c.toggleKey);
+        Log("config: ToggleKey = %s (live)", g_cfg.toggleKey[0] ? g_cfg.toggleKey : "(off)");
+    }
+    // Only a change in the file switches the fix, so an unrelated save
+    // doesn't undo the toggle key.
+    if (c.suballocate != g_cfg.suballocate)
+    {
+        g_cfg.suballocate = c.suballocate;
+        if (!g_sub.tierOk) Log("FIX: Suballocate = %d (live) - applied once the device is set up", c.suballocate);
+        else
+        {
+            InterlockedExchange(&g_sub.on, c.suballocate);
+            char sum[256];
+            SubSummary(sum, sizeof(sum));
+            Log("FIX: suballocation switched %s (live) | %s | %ld live, %ld made, %ld fell back",
+                c.suballocate ? "ON" : "OFF", sum, g_sub.live, g_sub.made, g_sub.fellBack);
+            if (c.suballocate && g_sub.growEvent) SetEvent(g_sub.growEvent);
+        }
+    }
+    {
+        char later[160] = {};
+        auto wait = [&](bool changed, const char* key)
+        {
+            if (!changed) return;
+            if (later[0]) strcat_s(later, sizeof(later), ", ");
+            strcat_s(later, sizeof(later), key);
+        };
+        wait(c.blockMB != g_cfg.blockMB, "BlockMB");
+        wait(c.prewarmBlocks != g_cfg.prewarmBlocks, "PrewarmBlocks");
+        wait(c.maxPoolMB != g_cfg.maxPoolMB, "MaxPoolMB");
+        wait(c.maxResourceKB != g_cfg.maxResourceKB, "MaxResourceKB");
+        wait(c.hostBlockMB != g_cfg.hostBlockMB, "HostBlockMB");
+        wait(c.maxHostPoolMB != g_cfg.maxHostPoolMB, "MaxHostPoolMB");
+        wait(c.probe != g_cfg.probe, "Probe");
+        if (later[0]) Log("config: %s changed - read at launch, so it takes effect next launch", later);
+    }
+    bool engine = c.nEngine != g_cfg.nEngine;
+    for (int i = 0; i < c.nEngine && !engine; ++i)
+        engine = strcmp(c.engine[i].cls, g_cfg.engine[i].cls) || strcmp(c.engine[i].fld, g_cfg.engine[i].fld) ||
+                 strcmp(c.engine[i].val, g_cfg.engine[i].val);
+    if (engine)
+    {
+        EnsureCs(g_engineCs);
+        EnterCriticalSection(&g_engineCs.cs);
+        memcpy(g_cfg.engine, c.engine, sizeof(g_cfg.engine));
+        g_cfg.nEngine = c.nEngine;
+        LeaveCriticalSection(&g_engineCs.cs);
+        InterlockedExchange(&g_engineDirty, 1);
+        if (g_engineWake) SetEvent(g_engineWake);
+    }
+    Log("config reloaded");
+}
+
+// Watches the ini's timestamp; a save in any editor triggers a live reload
+// within about a second. Debounced on a stable timestamp (truncate-then-
+// write editors update it before the content lands), and a file too small
+// to hold a setting is skipped, warned once per timestamp.
+static DWORD WINAPI IniWatchThread(LPVOID)
+{
+    FILETIME last = { 0, 0 }, pend = { 0, 0 };
+    int stable = 0;
+    for (;;)
+    {
+        Sleep(500);
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (!GetFileAttributesExA(g_files.iniPath, GetFileExInfoStandard, &fad))
+            continue;
+        if (!last.dwLowDateTime && !last.dwHighDateTime)
+        { last = fad.ftLastWriteTime; continue; }
+        if (CompareFileTime(&fad.ftLastWriteTime, &last) == 0)
+        { stable = 0; continue; }
+        if (CompareFileTime(&fad.ftLastWriteTime, &pend) != 0)
+        { pend = fad.ftLastWriteTime; stable = 0; continue; }
+        if (++stable < 2) continue;
+        if (fad.nFileSizeHigh == 0 && fad.nFileSizeLow < 8)
+        {
+            static FILETIME lastWarn = { 0, 0 };
+            if (CompareFileTime(&fad.ftLastWriteTime, &lastWarn) != 0)
+            {
+                Log("ini reload skipped - file looks incomplete");
+                lastWarn = fad.ftLastWriteTime;
+            }
+            continue;
+        }
+        last = fad.ftLastWriteTime;
+        stable = 0;
+        LoadConfigLive();
     }
 }
 
@@ -1742,7 +1959,9 @@ static DWORD WINAPI InitThread(LPVOID)
         if ((t = CreateThread(NULL, 0, WriterThread, NULL, 0, NULL))) CloseHandle(t);
     if ((t = CreateThread(NULL, 0, KeyThread, NULL, 0, NULL))) CloseHandle(t);
     if (g_cfg.probe && (t = CreateThread(NULL, 0, ProbeWatchThread, NULL, 0, NULL))) CloseHandle(t);
-    if (g_cfg.nEngine && (t = CreateThread(NULL, 0, EngineThread, NULL, 0, NULL))) CloseHandle(t);
+    g_engineWake = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (g_engineWake && (t = CreateThread(NULL, 0, EngineThread, NULL, 0, NULL))) CloseHandle(t);
+    if ((t = CreateThread(NULL, 0, IniWatchThread, NULL, 0, NULL))) CloseHandle(t);
     return 0;
 }
 

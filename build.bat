@@ -13,5 +13,5 @@ cl /nologo /LD /O2 /MT /EHsc /W3 /std:c++17 /Fodist\ /Fedist\ishimurapatch.asi ^
    ishimurapatch.cpp vtindex.c ^
    third_party\minhook\src\hook.c third_party\minhook\src\buffer.c ^
    third_party\minhook\src\trampoline.c third_party\minhook\src\hde\hde64.c || exit /b 1
-rem the development probe (loaded by the mod at runtime when [Settings] Probe = 1)
+rem the development probe (loaded by the mod at runtime when [Advanced] Probe = 1)
 cl /nologo /LD /O2 /MT /EHsc /W3 /std:c++17 /Fodist\ /Fedist\ishimurapatch_probe.dll probe.cpp
