@@ -69,7 +69,8 @@ extern const int VT_GetResourceAllocationInfo, VT_CreateCommittedResource, VT_Cr
     VT_CreatePlacedResource, VT_CreateReservedResource, VT_MakeResident, VT_Evict,
     VT_EnqueueMakeResident, VT_CreateCommittedResource1, VT_CreateHeap1, VT_CreateReservedResource1,
     VT_CreateCommittedResource2, VT_CreatePlacedResource1, VT_CreateCommittedResource3,
-    VT_CreatePlacedResource2, VT_CreateReservedResource2, VT_Present, VT_Present1;
+    VT_CreatePlacedResource2, VT_CreateReservedResource2, VT_Present, VT_Present1,
+    VT_CreateCommandQueue, VT_CreateCommandQueue1, VT_Q_ExecuteCommandLists, VT_Q_Signal, VT_Q_Wait;
 }
 
 // ----------------------------------------------------------------------------
@@ -101,6 +102,7 @@ struct Config
     int  reflex = 0;
     int  dataReadMBs = 0;
     int  maxFps = 0;
+    int  raiseDirectQueue = 0;
     struct { char cls[96], fld[96], val[64]; } engine[16];   // [Engine] Class.Field = value
     int  nEngine = 0;
 };
@@ -237,6 +239,12 @@ static const char* DEFAULT_INI =
 "; 0 = off (default), or 25-8000\n"
 "DataReadMBs = 0\n"
 "\n"
+"; DEVELOPMENT (read at launch). Create the game's graphics queues at high\n"
+"; priority, so the GPU favours drawing the frame over the other queues'\n"
+"; work (streaming uploads, compute). An experiment.\n"
+"; 0 = off (default), 1 = on\n"
+"RaiseDirectQueue = 0\n"
+"\n"
 "; DEVELOPMENT (read at launch). Runs ishimurapatch_probe.dll (beside this\n"
 "; file) once each time it changes, from 20 seconds after the game starts:\n"
 "; reverse-engineering code that is rebuilt while the game runs. Without\n"
@@ -287,6 +295,7 @@ static void ReadConfig(Config& c, const Config& fb)
     c.hitchMs = GetPrivateProfileIntA("Advanced", "HitchMs", fb.hitchMs, ini);
     GetPrivateProfileStringA("Advanced", "CaptureKey", fb.captureKey, c.captureKey, sizeof(c.captureKey), ini);
     c.probe   = GetPrivateProfileIntA("Advanced", "Probe", fb.probe, ini) ? 1 : 0;
+    c.raiseDirectQueue = GetPrivateProfileIntA("Advanced", "RaiseDirectQueue", fb.raiseDirectQueue, ini) ? 1 : 0;
 
     if (c.logging < 0 || c.logging > 2) c.logging = fb.logging;
     if (c.hitchMs < 1) c.hitchMs = fb.hitchMs;
@@ -1417,9 +1426,9 @@ static DWORD WINAPI ThrottleThread(LPVOID)
         if (!g_cfg.dataReadMBs) continue;
         LONGLONG r = g_thReads, b = g_thBytes, d = g_thDelayTicks;
         if (r == reads) continue;
-        Log("THROTTLE: %lld MB of game data in %lld reads in the last 5 s, %.0f ms of waiting (cap %d MB/s);"
-            " %lld larger reads of other files passed straight through",
-            (b - bytes) >> 20, r - reads, Ms(d - delay), g_cfg.dataReadMBs, g_thPassed);
+        Log("THROTTLE at %.0f s: %lld MB of game data in %lld reads in the last 5 s, %.0f ms of waiting"
+            " (cap %d MB/s); %lld larger reads of other files passed straight through",
+            Ms(Now() - g_qpc0) / 1000.0, (b - bytes) >> 20, r - reads, Ms(d - delay), g_cfg.dataReadMBs, g_thPassed);
         reads = r; bytes = b; delay = d;
     }
 }
@@ -1787,6 +1796,203 @@ static PFN_D3D12CreateDevice o_D3D12CreateDevice;
 static volatile LONG g_devicePatched = 0;
 static bool DeviceReady() { return g_devicePatched != 0; }
 
+// ----------------------------------------------------------------------------
+// GPU queues (diagnostic). ETW at the lift (10/19): with the same submission
+// rate, the three main render contexts' work took 0.62 ms per packet at the
+// boundary against 0.12 in quiet play, while one other context went from 30
+// to 88 submissions a second. Which queues those are, and whether one waits on
+// another, is not in the trace. So every command queue the game creates is
+// logged (type, priority), and ExecuteCommandLists, Signal and Wait are counted
+// per queue; a QUEUES line every half second gives each queue's submissions, command
+// lists and GPU-side waits, and which queue's fence each wait was for.
+// The queue methods are hooked on their code (MinHook), as Present is: overlays
+// patch command queue vtables too.
+// ----------------------------------------------------------------------------
+static const int MAX_QUEUES = 16;
+struct QueueInfo
+{
+    void*         q;
+    int           type, prio;
+    volatile LONG submits, lists, signals, waits;
+    volatile LONG waitOn[MAX_QUEUES + 1];   // waits per signalling queue (last = unknown)
+};
+static QueueInfo     g_queues[MAX_QUEUES];
+static volatile LONG g_nQueues = 0;
+static volatile LONG g_queueHooks = 0;
+
+// fence -> the queue that signalled it last (a small open table)
+struct FenceOwner { void* fence; volatile LONG queue; };
+static FenceOwner g_fences[256];
+
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommandQueue)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateCommandQueue1)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*, REFIID, REFIID, void**);
+typedef void    (STDMETHODCALLTYPE* PFN_ExecuteCommandLists)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_QueueFence)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
+static PFN_CreateCommandQueue  o_CreateCommandQueue = NULL;
+static PFN_CreateCommandQueue1 o_CreateCommandQueue1 = NULL;
+static PFN_ExecuteCommandLists o_ExecuteCommandLists = NULL;
+static PFN_QueueFence          o_Signal = NULL, o_Wait = NULL;
+
+static int QueueIndex(void* q)
+{
+    LONG n = g_nQueues; if (n > MAX_QUEUES) n = MAX_QUEUES;
+    for (int i = 0; i < n; ++i) if (g_queues[i].q == q) return i;
+    return -1;
+}
+
+static FenceOwner* FenceSlot(void* fence, bool add)
+{
+    UINT64 h = ((UINT64)fence >> 4) * 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < 256; ++i)
+    {
+        FenceOwner& f = g_fences[(h + i) & 255];
+        if (f.fence == fence) return &f;
+        if (!f.fence)
+        {
+            if (!add) return NULL;
+            if (InterlockedCompareExchangePointer((void* volatile*)&f.fence, fence, NULL) == NULL) { f.queue = -1; return &f; }
+            if (f.fence == fence) return &f;
+        }
+    }
+    return NULL;
+}
+
+static void STDMETHODCALLTYPE h_ExecuteCommandLists(ID3D12CommandQueue* q, UINT n, ID3D12CommandList* const* lists)
+{
+    int i = QueueIndex(q);
+    if (i >= 0) { InterlockedIncrement(&g_queues[i].submits); InterlockedAdd(&g_queues[i].lists, (LONG)n); }
+    o_ExecuteCommandLists(q, n, lists);
+}
+
+static HRESULT STDMETHODCALLTYPE h_Signal(ID3D12CommandQueue* q, ID3D12Fence* fence, UINT64 v)
+{
+    int i = QueueIndex(q);
+    if (i >= 0)
+    {
+        InterlockedIncrement(&g_queues[i].signals);
+        if (FenceOwner* f = FenceSlot(fence, true)) InterlockedExchange(&f->queue, i);
+    }
+    return o_Signal(q, fence, v);
+}
+
+static HRESULT STDMETHODCALLTYPE h_Wait(ID3D12CommandQueue* q, ID3D12Fence* fence, UINT64 v)
+{
+    int i = QueueIndex(q);
+    if (i >= 0)
+    {
+        InterlockedIncrement(&g_queues[i].waits);
+        FenceOwner* f = FenceSlot(fence, false);
+        LONG from = f ? f->queue : -1;
+        InterlockedIncrement(&g_queues[i].waitOn[from >= 0 && from < MAX_QUEUES ? from : MAX_QUEUES]);
+    }
+    return o_Wait(q, fence, v);
+}
+
+static const char* QueueType(int t)
+{
+    switch (t)
+    {
+    case D3D12_COMMAND_LIST_TYPE_DIRECT:  return "DIRECT";
+    case D3D12_COMMAND_LIST_TYPE_COMPUTE: return "COMPUTE";
+    case D3D12_COMMAND_LIST_TYPE_COPY:    return "COPY";
+    default:                              return "OTHER";
+    }
+}
+
+static void HookQueueMethods(void* queue)
+{
+    if (InterlockedExchange(&g_queueHooks, 1)) return;
+    void** vt = *(void***)queue;
+    struct { int idx; void* det; void** orig; const char* name; } m[] = {
+        { VT_Q_ExecuteCommandLists, (void*)h_ExecuteCommandLists, (void**)&o_ExecuteCommandLists, "ExecuteCommandLists" },
+        { VT_Q_Signal,              (void*)h_Signal,              (void**)&o_Signal,              "Signal" },
+        { VT_Q_Wait,                (void*)h_Wait,                (void**)&o_Wait,                "Wait" },
+    };
+    char ok[160] = {};
+    for (auto& x : m)
+    {
+        MH_STATUS s = MH_CreateHook(vt[x.idx], x.det, x.orig);
+        if (s == MH_OK) s = MH_EnableHook(vt[x.idx]);
+        strcat_s(ok, sizeof(ok), ok[0] ? ", " : "");
+        strcat_s(ok, sizeof(ok), x.name);
+        if (s != MH_OK) { strcat_s(ok, sizeof(ok), " ("); strcat_s(ok, sizeof(ok), MH_StatusToString(s)); strcat_s(ok, sizeof(ok), ")"); }
+    }
+    Log("QUEUE: hooked %s on the queues' code", ok);
+}
+
+static void NoteQueue(const D3D12_COMMAND_QUEUE_DESC* d, void* q)
+{
+    if (!q || !d) return;
+    LONG i = InterlockedIncrement(&g_nQueues) - 1;
+    if (i >= MAX_QUEUES) { Log("QUEUE: more than %d queues; the rest are not counted", MAX_QUEUES); return; }
+    g_queues[i].type = d->Type; g_queues[i].prio = d->Priority;
+    g_queues[i].q = q;
+    Log("QUEUE %ld: %s, priority %d, flags 0x%X, node mask 0x%X", i, QueueType(d->Type), d->Priority,
+        (unsigned)d->Flags, d->NodeMask);
+    HookQueueMethods(q);
+}
+
+// [Advanced] RaiseDirectQueue = 1 creates the game's DIRECT (graphics) queues
+// at HIGH priority, so the GPU favours drawing the frame over other queues'
+// work (an experiment; priority is fixed when a queue is created).
+static const D3D12_COMMAND_QUEUE_DESC* QueueDesc(const D3D12_COMMAND_QUEUE_DESC* d, D3D12_COMMAND_QUEUE_DESC& copy)
+{
+    if (!g_cfg.raiseDirectQueue || !d || d->Type != D3D12_COMMAND_LIST_TYPE_DIRECT ||
+        d->Priority != D3D12_COMMAND_QUEUE_PRIORITY_NORMAL) return d;
+    copy = *d;
+    copy.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+    return &copy;
+}
+
+static HRESULT STDMETHODCALLTYPE h_CreateCommandQueue(ID3D12Device* dev, const D3D12_COMMAND_QUEUE_DESC* d, REFIID riid, void** pp)
+{
+    D3D12_COMMAND_QUEUE_DESC copy;
+    d = QueueDesc(d, copy);
+    HRESULT hr = o_CreateCommandQueue(dev, d, riid, pp);
+    if (SUCCEEDED(hr) && pp) NoteQueue(d, *pp);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE h_CreateCommandQueue1(ID3D12Device* dev, const D3D12_COMMAND_QUEUE_DESC* d, REFIID creator, REFIID riid, void** pp)
+{
+    D3D12_COMMAND_QUEUE_DESC copy;
+    d = QueueDesc(d, copy);
+    HRESULT hr = o_CreateCommandQueue1(dev, d, creator, riid, pp);
+    if (SUCCEEDED(hr) && pp) NoteQueue(d, *pp);
+    return hr;
+}
+
+// Two lines a second: each active queue's submissions, command lists, signals
+// and GPU-side waits (and whose fence they waited for).
+static DWORD WINAPI QueueStatsThread(LPVOID)
+{
+    for (;;)
+    {
+        Sleep(500);
+        LONG n = g_nQueues; if (n > MAX_QUEUES) n = MAX_QUEUES;
+        if (!n || !g_cfg.logging) continue;
+        char line[1024]; int p = 0; line[0] = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            QueueInfo& q = g_queues[i];
+            LONG s = InterlockedExchange(&q.submits, 0), l = InterlockedExchange(&q.lists, 0);
+            LONG sg = InterlockedExchange(&q.signals, 0), w = InterlockedExchange(&q.waits, 0);
+            char on[160]; int op = 0; on[0] = 0;
+            for (int k = 0; k <= MAX_QUEUES; ++k)
+            {
+                LONG c = InterlockedExchange(&q.waitOn[k], 0);
+                if (!c) continue;
+                if (k < MAX_QUEUES) op += _snprintf_s(on + op, sizeof(on) - op, _TRUNCATE, "%s%ld on Q%d", op ? " " : "", c, k);
+                else op += _snprintf_s(on + op, sizeof(on) - op, _TRUNCATE, "%s%ld on a fence no queue signalled", op ? " " : "", c);
+            }
+            if (!s && !sg && !w) continue;
+            p += _snprintf_s(line + p, sizeof(line) - p, _TRUNCATE, "%sQ%d %.1s %ld/%ld s%ld w%ld%s%s%s",
+                             p ? " | " : "", i, QueueType(q.type), s, l, sg, w, on[0] ? " (" : "", on, on[0] ? ")" : "");
+        }
+        if (p) Log("QUEUES at %.0f s (submits/lists, signals, waits): %s", Ms(Now() - g_qpc0) / 1000.0, line);
+    }
+}
+
 static void PatchDevice(ID3D12Device* dev, const char* how)
 {
     if (InterlockedCompareExchange(&g_devicePatched, 1, 0) != 0) return;
@@ -1806,6 +2012,8 @@ static void PatchDevice(ID3D12Device* dev, const char* how)
         how, mod, (unsigned long long)((UINT_PTR)vt - base), ver, level ? level : 1);
 
     struct { int idx; void* det; void** orig; int need; const char* name; } slots[] = {
+        { VT_CreateCommandQueue,       (void*)h_CreateCommandQueue,  (void**)&o_CreateCommandQueue,  0, "CreateCommandQueue" },
+        { VT_CreateCommandQueue1,      (void*)h_CreateCommandQueue1, (void**)&o_CreateCommandQueue1, 9, "CreateCommandQueue1" },
         { VT_CreateCommittedResource,  (void*)h_CCR,  (void**)&o_CCR,  0,  "CreateCommittedResource" },
         { VT_CreateHeap,               (void*)h_CH,   (void**)&o_CH,   0,  "CreateHeap" },
         { VT_CreatePlacedResource,     (void*)h_CPR,  (void**)&o_CPR,  0,  "CreatePlacedResource" },
@@ -2246,7 +2454,8 @@ static DWORD WINAPI InitThread(LPVOID)
         " | HostBlockMB = %d | MaxHostPoolMB = %d",
         g_cfg.suballocate, g_cfg.toggleKey[0] ? g_cfg.toggleKey : "(off)", g_cfg.blockMB, g_cfg.prewarmBlocks,
         g_cfg.maxPoolMB, g_cfg.maxResourceKB, g_cfg.hostBlockMB, g_cfg.maxHostPoolMB);
-    Log("config: MaxFps = %d | Reflex = %d | DataReadMBs = %d", g_cfg.maxFps, g_cfg.reflex, g_cfg.dataReadMBs);
+    Log("config: MaxFps = %d | Reflex = %d | DataReadMBs = %d | RaiseDirectQueue = %d", g_cfg.maxFps, g_cfg.reflex,
+        g_cfg.dataReadMBs, g_cfg.raiseDirectQueue);
     Log("config: Probe = %d | [Engine] %d setting%s", g_cfg.probe, g_cfg.nEngine, g_cfg.nEngine == 1 ? "" : "s");
     for (int i = 0; i < g_cfg.nEngine; ++i)
         Log("config:   %s.%s = %s", g_cfg.engine[i].cls, g_cfg.engine[i].fld, g_cfg.engine[i].val);
@@ -2290,6 +2499,7 @@ static DWORD WINAPI InitThread(LPVOID)
     HANDLE t;
     if (g_cfg.nEngine && (t = CreateThread(NULL, 0, EarlyEngineThread, NULL, 0, NULL))) CloseHandle(t);
     if ((t = CreateThread(NULL, 0, FallbackThread, NULL, 0, NULL))) CloseHandle(t);
+    if ((t = CreateThread(NULL, 0, QueueStatsThread, NULL, 0, NULL))) CloseHandle(t);
     if (o_NtReadFile && (t = CreateThread(NULL, 0, ThrottleThread, NULL, 0, NULL))) CloseHandle(t);
     if (g_cfg.logging == 2 && g_ring)
         if ((t = CreateThread(NULL, 0, WriterThread, NULL, 0, NULL))) CloseHandle(t);

@@ -28,3 +28,9 @@ const int VT_CreatePlacedResource2    = DEV(CreatePlacedResource2);
 const int VT_CreateReservedResource2  = DEV(CreateReservedResource2);
 const int VT_Present                  = SWAP(Present);
 const int VT_Present1                 = SWAP(Present1);
+
+#define QUEUE(f) (int)(offsetof(ID3D12CommandQueueVtbl, f) / sizeof(void*))
+const int VT_CreateCommandQueue1      = DEV(CreateCommandQueue1);
+const int VT_Q_ExecuteCommandLists    = QUEUE(ExecuteCommandLists);
+const int VT_Q_Signal                 = QUEUE(Signal);
+const int VT_Q_Wait                   = QUEUE(Wait);
