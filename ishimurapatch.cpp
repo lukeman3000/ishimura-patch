@@ -100,6 +100,7 @@ struct Config
     int  probe = 0;
     int  reflex = 0;
     int  dataReadMBs = 0;
+    int  maxFps = 0;
     struct { char cls[96], fld[96], val[64]; } engine[16];   // [Engine] Class.Field = value
     int  nEngine = 0;
 };
@@ -158,6 +159,19 @@ static const char* DEFAULT_INI =
 "; 4-64) and the most they may total (MB, 16-2048).\n"
 "HostBlockMB = 32\n"
 "MaxHostPoolMB = 512\n"
+"\n"
+"\n"
+"[FrameRate]\n"
+"\n"
+"; Caps the frame rate. At the game's streaming boundaries the frames that\n"
+"; reach the screen late are the ones where the GPU has extra work to do;\n"
+"; with your frame rate pinned at the GPU's limit there is no room for it.\n"
+"; A cap a little below what the GPU can hold gives it that room. The wait\n"
+"; happens right after a frame is handed to Windows, so the next frame\n"
+"; starts after it and every frame is the same length. Turn off any other\n"
+"; frame cap (NVIDIA control panel, RTSS) or set it higher than this one.\n"
+"; 0 = off (default), otherwise the cap in frames per second (20-2000).\n"
+"MaxFps = 0\n"
 "\n"
 "\n"
 "[Reflex]\n"
@@ -240,6 +254,7 @@ static void ReadConfig(Config& c, const Config& fb)
     const char* ini = g_files.iniPath;
     c.suballocate   = GetPrivateProfileIntA("Fix", "Suballocate", fb.suballocate, ini) ? 1 : 0;
     c.reflex        = GetPrivateProfileIntA("Reflex", "Reflex", fb.reflex, ini) ? 1 : 0;
+    c.maxFps        = GetPrivateProfileIntA("FrameRate", "MaxFps", fb.maxFps, ini);
     c.dataReadMBs   = GetPrivateProfileIntA("Advanced", "DataReadMBs", fb.dataReadMBs, ini);
     GetPrivateProfileStringA("Fix", "ToggleKey", fb.toggleKey, c.toggleKey, sizeof(c.toggleKey), ini);
     c.blockMB       = GetPrivateProfileIntA("Fix", "BlockMB", fb.blockMB, ini);
@@ -283,6 +298,9 @@ static void ReadConfig(Config& c, const Config& fb)
     if (c.hostBlockMB < 4 || c.hostBlockMB > 64) c.hostBlockMB = fb.hostBlockMB;
     if (c.maxHostPoolMB < 16 || c.maxHostPoolMB > 2048) c.maxHostPoolMB = fb.maxHostPoolMB;
     if (c.maxHostPoolMB < c.hostBlockMB) c.maxHostPoolMB = c.hostBlockMB;
+    if (c.maxFps < 0) c.maxFps = 0;
+    if (c.maxFps > 0 && c.maxFps < 20) c.maxFps = 20;
+    if (c.maxFps > 2000) c.maxFps = 2000;
     if (c.dataReadMBs && (c.dataReadMBs < 25 || c.dataReadMBs > 8000)) c.dataReadMBs = fb.dataReadMBs;
 }
 
@@ -1233,10 +1251,66 @@ static void OnFrame()
     }
 }
 
+// ----------------------------------------------------------------------------
+// The frame limiter ([FrameRate] MaxFps, the Mouse Fix design). PresentMon at
+// the lift (10/19): the frames that reach the screen late are GPU frames,
+// 7.5 ms of GPU work against 5.3 normally, while the frames that are late on
+// the CPU side are hidden by the frame queue. At a 163 fps cap a frame has
+// 6.13 ms and the GPU's 90th percentile is already 6.17, so the extra work a
+// streaming boundary brings has nowhere to go. A lower cap gives the GPU that
+// headroom. The wait happens right after Present returns, so the next frame
+// starts (and reads input) after it; a high-resolution waitable timer carries
+// most of the wait and a spin the last half millisecond. It only ever
+// lengthens frames, and keeps an even cadence: a frame that runs late resets
+// the schedule instead of letting the next ones rush to catch up.
+// ----------------------------------------------------------------------------
+struct FrameLimiter
+{
+    LONGLONG last = 0;          // when the last frame was released (QPC), 0 = unset
+    HANDLE   timer = NULL;
+    bool     timerTried = false;
+};
+static FrameLimiter g_lim;
+
+static void LimitFrame()
+{
+    int fps = g_cfg.maxFps;
+    if (fps <= 0) { g_lim.last = 0; return; }
+    LONGLONG period = g_qpcFreq / fps;
+    LONGLONG now = Now();
+    LONGLONG due = g_lim.last + period;
+    if (g_lim.last && now < due)
+    {
+        if (!g_lim.timerTried)
+        {
+            g_lim.timerTried = true;
+            g_lim.timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        }
+        LONGLONG spin = g_qpcFreq / 2000;   // the last 0.5 ms
+        LONGLONG sleepTicks = due - now - spin;
+        if (sleepTicks > 0)
+        {
+            LONGLONG hns = sleepTicks * 10000000 / g_qpcFreq;   // 100 ns units
+            if (g_lim.timer)
+            {
+                LARGE_INTEGER rel; rel.QuadPart = -hns;
+                if (SetWaitableTimerEx(g_lim.timer, &rel, 0, NULL, NULL, NULL, 0))
+                    WaitForSingleObject(g_lim.timer, INFINITE);
+            }
+            else Sleep((DWORD)(hns / 10000));
+        }
+        while (Now() < due) YieldProcessor();
+        now = due;
+    }
+    // keep the cadence while on time; after a late frame, start afresh from now
+    g_lim.last = (g_lim.last && now - due < period) ? due : Now();
+}
+
 static HRESULT STDMETHODCALLTYPE h_Present(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
     if (!t_inPresent++ && !(flags & DXGI_PRESENT_TEST)) OnFrame();
     HRESULT hr = o_Present(sc, sync, flags);
+    if (t_inPresent == 1 && !(flags & DXGI_PRESENT_TEST)) LimitFrame();
     --t_inPresent;
     return hr;
 }
@@ -1244,6 +1318,7 @@ static HRESULT STDMETHODCALLTYPE h_Present1(IDXGISwapChain1* sc, UINT sync, UINT
 {
     if (!t_inPresent++ && !(flags & DXGI_PRESENT_TEST)) OnFrame();
     HRESULT hr = o_Present1(sc, sync, flags, pp);
+    if (t_inPresent == 1 && !(flags & DXGI_PRESENT_TEST)) LimitFrame();
     --t_inPresent;
     return hr;
 }
@@ -2023,6 +2098,12 @@ static void LoadConfigLive()
         Log("config: Logging = %d (live)", g_cfg.logging);
     }
     if (c.hitchMs != g_cfg.hitchMs) { g_cfg.hitchMs = c.hitchMs; Log("config: HitchMs = %d (live)", g_cfg.hitchMs); }
+    if (c.maxFps != g_cfg.maxFps)
+    {
+        g_cfg.maxFps = c.maxFps;
+        if (c.maxFps) Log("config: MaxFps = %d (live)", c.maxFps);
+        else Log("config: MaxFps off (live)");
+    }
     if (c.dataReadMBs != g_cfg.dataReadMBs)
     {
         g_cfg.dataReadMBs = c.dataReadMBs;
@@ -2165,7 +2246,7 @@ static DWORD WINAPI InitThread(LPVOID)
         " | HostBlockMB = %d | MaxHostPoolMB = %d",
         g_cfg.suballocate, g_cfg.toggleKey[0] ? g_cfg.toggleKey : "(off)", g_cfg.blockMB, g_cfg.prewarmBlocks,
         g_cfg.maxPoolMB, g_cfg.maxResourceKB, g_cfg.hostBlockMB, g_cfg.maxHostPoolMB);
-    Log("config: Reflex = %d | DataReadMBs = %d", g_cfg.reflex, g_cfg.dataReadMBs);
+    Log("config: MaxFps = %d | Reflex = %d | DataReadMBs = %d", g_cfg.maxFps, g_cfg.reflex, g_cfg.dataReadMBs);
     Log("config: Probe = %d | [Engine] %d setting%s", g_cfg.probe, g_cfg.nEngine, g_cfg.nEngine == 1 ? "" : "s");
     for (int i = 0; i < g_cfg.nEngine; ++i)
         Log("config:   %s.%s = %s", g_cfg.engine[i].cls, g_cfg.engine[i].fld, g_cfg.engine[i].val);
