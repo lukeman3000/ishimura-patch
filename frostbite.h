@@ -219,6 +219,56 @@ static int FindObjects(const Shape& sh, BYTE** objs, int max)
     return n;
 }
 
+// Any settings object by its class name. A live settings object starts with
+// its vtable (in .link) and its runtime type (in .debug); every settings
+// vtable's slot 0 is the same accessor, "mov rax,[rcx+8]; ret", returning that
+// type (probe generations 6-8, 10/19). The name-to-type registry entries also
+// pair a .link and a .debug pointer, but their "vtable" points at the class
+// name, so the slot 0 check tells them apart.
+static bool IsTypeAccessor(UINT64 fn)
+{
+    static const BYTE code[5] = { 0x48, 0x8B, 0x41, 0x08, 0xC3 };
+    BYTE b[5];
+    return InImage(fn) && SafeRead((void*)fn, b, 5) && !memcmp(b, code, 5);
+}
+
+static bool TypedChunk(const char* cls, BYTE* p, SIZE_T n, BYTE** found, int max, int& hits,
+                       const ImgSec* link, const ImgSec* dbg)
+{
+    __try
+    {
+        for (SIZE_T i = 0; i + 16 <= n; i += 8)
+        {
+            BYTE* vt = *(BYTE**)(p + i);
+            BYTE* ty = *(BYTE**)(p + i + 8);
+            if (vt < link->p || vt + 8 > link->p + link->n || ty < dbg->p || ty >= dbg->p + dbg->n) continue;
+            if (!IsTypeAccessor(*(UINT64*)vt)) continue;
+            char tn[96];
+            if (strcmp(TypeName((UINT64)ty, tn, sizeof(tn)), cls)) continue;
+            if (hits < max) found[hits++] = p + i;
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static int FindObjectsByType(const char* cls, BYTE** objs, int max)
+{
+    const ImgSec *link = NULL, *dbg = NULL;
+    for (int i = 0; i < g_nsecs; ++i)
+    {
+        if (!strcmp(g_secs[i].name, ".link")) link = &g_secs[i];
+        if (!strcmp(g_secs[i].name, ".debug")) dbg = &g_secs[i];
+    }
+    if (!link || !dbg) return 0;
+    int hits = 0;
+    ScanStats st;
+    ScanMemory([&](BYTE* p, SIZE_T len) { return TypedChunk(cls, p, len, objs, max, hits, link, dbg); }, st);
+    int n = 0;
+    for (int j = 0; j < hits; ++j) if (!SecOf(objs[j])) objs[n++] = objs[j];   // heap objects only
+    return n;
+}
+
 // One "Class.Field = value" setting, resolved once (the live objects, the
 // field's offset and type, the value encoded for that type) and applied as
 // often as needed: Apply only writes objects whose value differs. Types come
@@ -230,17 +280,63 @@ struct SettingRef
     int   k, width;
     UINT16 off;
     BYTE  bytes[4];
-    BYTE  orig[4][4];   // each object's value before our first write
-    bool  haveOrig[4];  // (what PutBackSetting restores)
+    bool  enum4;        // a 4-byte enum, written as an Int32
 };
 
-// r.val encoded as r.type into r.bytes; false for a type not written.
+// The game's own value of every field the mod has written, recorded at the
+// first write by any thread (the startup writer and the [Engine] thread both
+// write; a record per SettingRef took the other's value for the game's,
+// 10/19), and written back when a setting is taken out.
+struct OrigEntry { BYTE* addr; BYTE v[4]; };
+static OrigEntry     g_orig[256];
+static int           g_nOrig = 0;
+static volatile LONG g_origLock = 0;
+
+static void OrigLock()   { while (InterlockedExchange(&g_origLock, 1)) Sleep(0); }
+static void OrigUnlock() { InterlockedExchange(&g_origLock, 0); }
+
+static void OrigRecord(BYTE* addr, const BYTE* old)
+{
+    OrigLock();
+    int i = 0;
+    while (i < g_nOrig && g_orig[i].addr != addr) ++i;
+    if (i == g_nOrig && g_nOrig < 256) { g_orig[i].addr = addr; memcpy(g_orig[i].v, old, 4); ++g_nOrig; }
+    OrigUnlock();
+}
+
+// Copies the recorded value into out; with forget, drops the record.
+static bool OrigTake(BYTE* addr, BYTE* out, bool forget)
+{
+    OrigLock();
+    int i = 0;
+    while (i < g_nOrig && g_orig[i].addr != addr) ++i;
+    bool ok = i < g_nOrig;
+    if (ok)
+    {
+        memcpy(out, g_orig[i].v, 4);
+        if (forget) g_orig[i] = g_orig[--g_nOrig];
+    }
+    OrigUnlock();
+    return ok;
+}
+
+// The byte size a runtime type's static record declares (+0x0E), 0 if unknown.
+static UINT16 TypeSize(UINT64 rt)
+{
+    UINT64 rec = 0; UINT16 size = 0;
+    if (!SafeRead((void*)rt, &rec, 8) || !InImage(rec) || !SafeRead((BYTE*)rec + 0x0E, &size, 2)) return 0;
+    return size;
+}
+
+// r.val encoded as r.type into r.bytes; false for a type not written. An enum
+// (NvidiaReflexMode: its own named type, 4 bytes) is written as an Int32.
 static bool EncodeSetting(SettingRef& r)
 {
     if (!strcmp(r.type, "Boolean"))      { r.bytes[0] = (BYTE)(atoi(r.val) != 0); r.width = 1; }
     else if (!strcmp(r.type, "Uint32"))  { UINT32 v = (UINT32)strtoul(r.val, NULL, 10); memcpy(r.bytes, &v, 4); r.width = 4; }
     else if (!strcmp(r.type, "Int32"))   { INT32 v = (INT32)strtol(r.val, NULL, 10); memcpy(r.bytes, &v, 4); r.width = 4; }
     else if (!strcmp(r.type, "Float32")) { float v = (float)atof(r.val); memcpy(r.bytes, &v, 4); r.width = 4; }
+    else if (r.enum4) { INT32 v = (INT32)strtol(r.val, NULL, 10); memcpy(r.bytes, &v, 4); r.width = 4; }
     else return false;
     return true;
 }
@@ -248,10 +344,7 @@ static bool EncodeSetting(SettingRef& r)
 static bool ResolveSetting(SettingRef& r, const char* tag, bool quiet = false)
 {
     r.k = 0;
-    const Shape* sh = NULL;
-    for (const Shape& s : SHAPES) if (!strcmp(s.cls, r.cls)) sh = &s;
-    if (!sh) { Log("%s: %s.%s - class not supported", tag, r.cls, r.fld); return false; }
-    static FieldDesc fields[128];
+    FieldDesc fields[128];   // not static: the startup writer and the [Engine] thread both resolve
     BYTE* rec = FindTypeRecord(r.cls);
     UINT16 size = 0; UINT64 rt = 0;
     int n = rec ? ReadFields(rec, fields, 128, &size, &rt) : 0;
@@ -260,9 +353,21 @@ static bool ResolveSetting(SettingRef& r, const char* tag, bool quiet = false)
     if (!fd) { Log("%s: %s.%s - no such field%s", tag, r.cls, r.fld, rec ? "" : " (class record NOT FOUND)"); return false; }
     TypeName(fd->type, r.type, sizeof(r.type));
     r.off = fd->off;
-    if (!EncodeSetting(r)) { Log("%s: %s.%s is a %s - not written", tag, r.cls, r.fld, r.type[0] ? r.type : "type of unknown name"); return false; }
-    r.k = FindObjects(*sh, r.objs, 4);
-    memset(r.haveOrig, 0, sizeof(r.haveOrig));
+    r.enum4 = false;
+    if (r.type[0] && strcmp(r.type, "Boolean") && strcmp(r.type, "Uint32") && strcmp(r.type, "Int32") && strcmp(r.type, "Float32"))
+    {
+        // a named 4-byte type whose next field starts 4 bytes on: an enum
+        UINT16 next = 0xFFFF;
+        for (int i = 0; i < n; ++i) if (fields[i].off > r.off && fields[i].off < next) next = fields[i].off;
+        r.enum4 = TypeSize(fd->type) == 4 && (next == 0xFFFF || next - r.off == 4);
+    }
+    if (!EncodeSetting(r))
+    {
+        // an unnamed type is type info not filled in yet (startup): quietly retried
+        if (!quiet || r.type[0]) Log("%s: %s.%s is a %s - not written", tag, r.cls, r.fld, r.type[0] ? r.type : "type of unknown name");
+        return false;
+    }
+    r.k = FindObjectsByType(r.cls, r.objs, 4);
     if (!r.k) { if (!quiet) Log("%s: %s.%s - no live object found", tag, r.cls, r.fld); return false; }
     return true;
 }
@@ -286,32 +391,37 @@ static int ApplySetting(SettingRef& r, const char* tag)
         if (!memcmp(old, r.bytes, r.width)) continue;
         __try { memcpy(r.objs[j] + r.off, r.bytes, r.width); }
         __except (EXCEPTION_EXECUTE_HANDLER) { Log("%s: %s.%s write FAILED @ %p", tag, r.cls, r.fld, r.objs[j]); return -1; }
-        if (!r.haveOrig[j]) { memcpy(r.orig[j], old, 4); r.haveOrig[j] = true; }
+        OrigRecord(r.objs[j] + r.off, old);
         LogValue(tag, r, j, old, r.bytes);
         ++done;
     }
     return done;
 }
 
-// Writes back each object's value from before our first write (a line taken
-// out of [Engine] live). Returns how many were written.
+// Writes back each object's value from before the mod's first write (a line
+// taken out of [Engine] live). Returns how many were written.
 static int PutBackSetting(SettingRef& r, const char* tag)
 {
     int done = 0;
     for (int j = 0; j < r.k; ++j)
     {
-        BYTE old[4] = {};
-        if (!r.haveOrig[j] || !SafeRead(r.objs[j] + r.off, old, r.width)) continue;
-        if (memcmp(old, r.orig[j], r.width))
-        {
-            __try { memcpy(r.objs[j] + r.off, r.orig[j], r.width); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
-            LogValue(tag, r, j, old, r.orig[j]);
-            ++done;
-        }
-        r.haveOrig[j] = false;
+        BYTE old[4] = {}, orig[4] = {};
+        if (!OrigTake(r.objs[j] + r.off, orig, true) || !SafeRead(r.objs[j] + r.off, old, r.width)) continue;
+        if (!memcmp(old, orig, r.width)) continue;
+        __try { memcpy(r.objs[j] + r.off, orig, r.width); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        LogValue(tag, r, j, old, orig);
+        ++done;
     }
     return done;
+}
+
+// Whether the mod has written this setting (so taking it out puts a value back).
+static bool SettingWritten(const SettingRef& r)
+{
+    BYTE v[4];
+    for (int j = 0; j < r.k; ++j) if (OrigTake(r.objs[j] + r.off, v, false)) return true;
+    return false;
 }
 
 // Both steps at once (the probe's one-shot writes).

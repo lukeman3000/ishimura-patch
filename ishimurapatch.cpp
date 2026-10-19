@@ -62,7 +62,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "version.lib")
 
-static const char* MOD_VERSION = "0.3.1";
+static const char* MOD_VERSION = "0.3.2";
 
 extern "C" {
 extern const int VT_GetResourceAllocationInfo, VT_CreateCommittedResource, VT_CreateHeap,
@@ -98,6 +98,7 @@ struct Config
     int  hostBlockMB = 32;
     int  maxHostPoolMB = 512;
     int  probe = 0;
+    int  reflex = 0;
     struct { char cls[96], fld[96], val[64]; } engine[16];   // [Engine] Class.Field = value
     int  nEngine = 0;
 };
@@ -158,6 +159,18 @@ static const char* DEFAULT_INI =
 "MaxHostPoolMB = 512\n"
 "\n"
 "\n"
+"[Reflex]\n"
+"\n"
+"; (read at launch) NVIDIA Reflex, which the game runs with no menu option.\n"
+"; It paces each frame to keep the queue of finished frames empty, so every\n"
+"; small hitch reaches the screen; without it, most of the frames left over\n"
+"; from a streaming boundary don't (lift test: half as many long frames on\n"
+"; screen, for about 0.5 ms more latency at a 163 fps cap). 0 keeps NVIDIA's\n"
+"; Reflex plugin (sl.reflex.dll) from loading; the file is not touched.\n"
+"; 0 = off (default), 1 = the game's choice\n"
+"Reflex = 0\n"
+"\n"
+"\n"
 "; ============================================================================\n"
 ";  ENGINE SETTINGS - the game's own options, set in the running game\n"
 "; ============================================================================\n"
@@ -213,6 +226,7 @@ static void ReadConfig(Config& c, const Config& fb)
 {
     const char* ini = g_files.iniPath;
     c.suballocate   = GetPrivateProfileIntA("Fix", "Suballocate", fb.suballocate, ini) ? 1 : 0;
+    c.reflex        = GetPrivateProfileIntA("Reflex", "Reflex", fb.reflex, ini) ? 1 : 0;
     GetPrivateProfileStringA("Fix", "ToggleKey", fb.toggleKey, c.toggleKey, sizeof(c.toggleKey), ini);
     c.blockMB       = GetPrivateProfileIntA("Fix", "BlockMB", fb.blockMB, ini);
     c.prewarmBlocks = GetPrivateProfileIntA("Fix", "PrewarmBlocks", fb.prewarmBlocks, ini);
@@ -1227,6 +1241,48 @@ static HRESULT STDMETHODCALLTYPE h_Present1(IDXGISwapChain1* sc, UINT sync, UINT
 // game's first Present that way (10/18, Steam overlay loaded). Hooks on the
 // code chain one after another whatever order they go in.
 typedef HRESULT (WINAPI* PFN_CreateDXGIFactory2)(UINT, REFIID, void**);
+// ----------------------------------------------------------------------------
+// Reflex. The game runs NVIDIA Reflex through Streamline 1.3, which loads its
+// plugins from the game folder (sl.reflex.dll among them). The game asks for
+// low-latency mode 0, off (slSetFeatureConstants, logged by 0.3.2-dev, 10/19),
+// but with sl.reflex.dll loaded the frames are still paced by a Reflex sleep
+// each frame and the queue of finished frames stays empty, so small hitches
+// reach the screen. Without it (lift A/B, 20 passes each, the file renamed):
+// long frames on screen 7.0 -> 3.1 per pass, render-to-present latency
+// 4.6 -> 5.1 ms, no other change seen. With [Reflex] Reflex = 0 the mod turns
+// down the request to load sl.reflex.dll (ntdll!LdrLoadDll, the call every
+// LoadLibrary variant ends in), the same as the file being absent; the file
+// on disk is not touched.
+// ----------------------------------------------------------------------------
+struct UnicodeString { USHORT Length, MaximumLength; PWSTR Buffer; };
+typedef LONG (NTAPI* PFN_LdrLoadDll)(PWSTR path, PULONG flags, UnicodeString* name, PVOID* handle);
+static PFN_LdrLoadDll o_LdrLoadDll = NULL;
+
+static bool IsReflexPlugin(const UnicodeString* name)
+{
+    static const wchar_t want[] = L"sl.reflex.dll";
+    const size_t wl = sizeof(want) / sizeof(wchar_t) - 1;
+    if (!name || !name->Buffer) return false;
+    size_t n = name->Length / sizeof(wchar_t);
+    if (n < wl) return false;
+    const wchar_t* tail = name->Buffer + n - wl;
+    if (n > wl && tail[-1] != L'\\' && tail[-1] != L'/') return false;
+    return _wcsnicmp(tail, want, wl) == 0;
+}
+
+static LONG NTAPI h_LdrLoadDll(PWSTR path, PULONG flags, UnicodeString* name, PVOID* handle)
+{
+    if (!g_cfg.reflex && IsReflexPlugin(name))
+    {
+        static volatile LONG told = 0;
+        if (!InterlockedExchange(&told, 1))
+            Log("REFLEX: sl.reflex.dll not loaded ([Reflex] Reflex = 0), %.0f ms after the mod loaded", Ms(Now() - g_qpc0));
+        if (handle) *handle = NULL;
+        return (LONG)0xC0000135;   // STATUS_DLL_NOT_FOUND, as with the file absent
+    }
+    return o_LdrLoadDll(path, flags, name, handle);
+}
+
 static DWORD WINAPI PresentHookThread(LPVOID param)
 {
     ID3D12Device* dev = (ID3D12Device*)param;
@@ -1367,8 +1423,7 @@ static DWORD WINAPI EngineThread(LPVOID)
             for (int j = 0; j < n; ++j)
             {
                 if (taken[j]) continue;
-                bool ours = false;
-                for (int o = 0; o < slots[j].r.k; ++o) ours |= slots[j].r.haveOrig[o];
+                bool ours = SettingWritten(slots[j].r);
                 Log("ENGINE: %s.%s taken out (live)%s", slots[j].r.cls, slots[j].r.fld,
                     ours ? " - the game's own value goes back" : " - it was never changed");
                 if (ours) PutBackSetting(slots[j].r, "ENGINE: put back");
@@ -1411,6 +1466,80 @@ static DWORD WINAPI EngineThread(LPVOID)
         }
         WaitForSingleObject(g_engineWake, 1000);
     }
+}
+
+// Some engine settings are read once, while the engine starts (the loader's
+// FlurryLoaderSettings.MaxAsyncIoReads: a live write changed nothing, 10/19),
+// so [Engine] is also enforced from the moment the mod loads: find the objects
+// as soon as they exist, then rewrite any value the engine's config sets over
+// ours, every millisecond for the first minute (logged with times). After
+// that EngineThread keeps them as usual.
+static DWORD WINAPI EarlyEngineThread(LPVOID)
+{
+    static SettingRef refs[16];
+    int n = g_cfg.nEngine;
+    bool found[16] = {}, failed[16] = {}, haveRec[16] = {};
+    for (int i = 0; i < n; ++i)
+    {
+        refs[i] = SettingRef();
+        strncpy_s(refs[i].cls, sizeof(refs[i].cls), g_cfg.engine[i].cls, _TRUNCATE);
+        strncpy_s(refs[i].fld, sizeof(refs[i].fld), g_cfg.engine[i].fld, _TRUNCATE);
+        strncpy_s(refs[i].val, sizeof(refs[i].val), g_cfg.engine[i].val, _TRUNCATE);
+    }
+    ImgInit();
+    LONGLONG t0 = Now(), until = t0 + g_qpcFreq * 60;
+    int rewrites[16] = {}, scans[16] = {};
+    LONGLONG lastScan[16] = {};
+    while (Now() < until)
+    {
+        bool searching = false;
+        for (int i = 0; i < n; ++i)
+        {
+            if (failed[i]) continue;
+            if (!found[i])
+            {
+                searching = true;
+                if (!haveRec[i])
+                {
+                    if (!(haveRec[i] = FindTypeRecord(refs[i].cls) != NULL)) continue;   // type info not filled in yet
+                    Log("EARLY: %s type info readable at %.0f ms", refs[i].cls, Ms(Now() - g_qpc0));
+                }
+                LONGLONG s0 = Now();
+                bool ok = ResolveSetting(refs[i], "EARLY", true);
+                if (++scans[i] <= 3 || ok)
+                    Log("EARLY: %s scan %d took %.0f ms (%s)", refs[i].cls, scans[i], Ms(Now() - s0), ok ? "found" : "not yet");
+                if (!ok)
+                {
+                    if (!refs[i].width && refs[i].type[0]) failed[i] = true;   // a type we don't write
+                    continue;
+                }
+                found[i] = true;
+                Log("EARLY: %s.%s found %d object%s %.0f ms after the mod loaded", refs[i].cls, refs[i].fld, refs[i].k,
+                    refs[i].k == 1 ? "" : "s", Ms(Now() - g_qpc0));
+            }
+            // more copies can appear later (Dx12DisplaySettings: one at 0.3 s, the
+            // one the game uses after that, 10/19): look again 4x a second
+            if (refs[i].k < 4 && Now() - lastScan[i] > g_qpcFreq / 4 && Now() - t0 < g_qpcFreq * 30)
+            {
+                lastScan[i] = Now();
+                SettingRef more = refs[i];
+                if (ResolveSetting(more, "EARLY", true) && more.k > refs[i].k)
+                {
+                    Log("EARLY: %s.%s now %d objects (%.0f ms)", refs[i].cls, refs[i].fld, more.k, Ms(Now() - g_qpc0));
+                    refs[i] = more;
+                }
+            }
+            int done = ApplySetting(refs[i], "EARLY: set");
+            if (done > 0 && ++rewrites[i] <= 20)
+                Log("EARLY: %s.%s written at %.1f ms", refs[i].cls, refs[i].fld, Ms(Now() - g_qpc0));
+            if (done < 0) found[i] = false;
+        }
+        Sleep(searching ? 5 : 1);
+    }
+    for (int i = 0; i < n; ++i)
+        Log("EARLY: %s.%s %s, %d write%s in the first minute", refs[i].cls, refs[i].fld,
+            found[i] ? "kept" : "never found", rewrites[i], rewrites[i] == 1 ? "" : "s");
+    return 0;
 }
 
 // ----------------------------------------------------------------------------
@@ -1786,6 +1915,8 @@ static void LoadConfigLive()
         Log("config: Logging = %d (live)", g_cfg.logging);
     }
     if (c.hitchMs != g_cfg.hitchMs) { g_cfg.hitchMs = c.hitchMs; Log("config: HitchMs = %d (live)", g_cfg.hitchMs); }
+    if (c.reflex != g_cfg.reflex)
+        Log("config: Reflex = %d - read at launch, so it takes effect next launch", c.reflex);
     if (strcmp(c.captureKey, g_cfg.captureKey))
     {
         strcpy_s(g_cfg.captureKey, sizeof(g_cfg.captureKey), c.captureKey);
@@ -1920,6 +2051,7 @@ static DWORD WINAPI InitThread(LPVOID)
         " | HostBlockMB = %d | MaxHostPoolMB = %d",
         g_cfg.suballocate, g_cfg.toggleKey[0] ? g_cfg.toggleKey : "(off)", g_cfg.blockMB, g_cfg.prewarmBlocks,
         g_cfg.maxPoolMB, g_cfg.maxResourceKB, g_cfg.hostBlockMB, g_cfg.maxHostPoolMB);
+    Log("config: Reflex = %d", g_cfg.reflex);
     Log("config: Probe = %d | [Engine] %d setting%s", g_cfg.probe, g_cfg.nEngine, g_cfg.nEngine == 1 ? "" : "s");
     for (int i = 0; i < g_cfg.nEngine; ++i)
         Log("config:   %s.%s = %s", g_cfg.engine[i].cls, g_cfg.engine[i].fld, g_cfg.engine[i].val);
@@ -1949,11 +2081,17 @@ static DWORD WINAPI InitThread(LPVOID)
             Log("note: D3D12Core.dll already loaded at init - the device may predate the hook (fallback armed)");
         HookExport("d3d12.dll", "D3D12CreateDevice", (void*)h_D3D12CreateDevice,
                    (void**)&o_D3D12CreateDevice, "D3D12CreateDevice");
+        if (!g_cfg.reflex)
+        {
+            if (GetModuleHandleA("sl.reflex.dll")) Log("REFLEX: sl.reflex.dll already loaded - too late to keep it out this session");
+            HookExport("ntdll.dll", "LdrLoadDll", (void*)h_LdrLoadDll, (void**)&o_LdrLoadDll, "DLL loads (LdrLoadDll, to keep sl.reflex.dll out)");
+        }
     }
 
     Log("--- ishimurapatch init done ---");
 
     HANDLE t;
+    if (g_cfg.nEngine && (t = CreateThread(NULL, 0, EarlyEngineThread, NULL, 0, NULL))) CloseHandle(t);
     if ((t = CreateThread(NULL, 0, FallbackThread, NULL, 0, NULL))) CloseHandle(t);
     if (g_cfg.logging == 2 && g_ring)
         if ((t = CreateThread(NULL, 0, WriterThread, NULL, 0, NULL))) CloseHandle(t);

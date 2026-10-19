@@ -6,7 +6,8 @@
 //  once and unloads it, so a new probe needs no game restart. It must leave
 //  nothing behind (no threads, no hooks). Logging goes through the mod's log.
 //
-//  Current probe: the settings inspector. Frostbite describes each class
+//  Current probe (generation 13): NvidiaReflexSettings' values and types.
+//  The settings inspector. Frostbite describes each class
 //  in a static type record (decoded from Dead Space.exe, 10/18):
 //    +0x00 name | +0x0E u16 size | +0x28 runtime type | +0x32 u16 field count
 //    +0x38 runtime super | +0x40 field array
@@ -278,9 +279,59 @@ static void ApplySettings()
     Log("SETTINGS: %d value%s written", written, written == 1 ? "" : "s");
 }
 
+// Generation 10 (9 + the loader and Reflex settings' values): a live test of FlurryLoaderSettings through the new
+// type-based lookup (frostbite.h FindObjectsByType), from
+// ishimurapatch_settings.txt like generation 4.
+static void DumpNamed(BYTE* obj, const char* cls)
+{
+    static FieldDesc fields[128];
+    BYTE* rec = FindTypeRecord(cls);
+    if (!rec) return;
+    UINT16 size = 0; UINT64 rt = 0;
+    int n = ReadFields(rec, fields, 128, &size, &rt);
+    LogFieldsTyped(obj, fields, n, size);
+}
+
+static void ApplySettingsFile()
+{
+    char path[MAX_PATH];
+    HMODULE mod = GetModuleHandleA("ishimurapatch.asi");
+    if (!mod || !GetModuleFileNameA(mod, path, MAX_PATH)) return;
+    char* slash = strrchr(path, '\\');
+    if (!slash) return;
+    strcpy_s(slash + 1, path + sizeof(path) - slash - 1, "ishimurapatch_settings.txt");
+    FILE* f = NULL;
+    if (fopen_s(&f, path, "r") != 0 || !f) { Log("SETTINGS: no %s", path); return; }
+    char line[256];
+    while (fgets(line, sizeof(line), f))
+    {
+        char* hash = strchr(line, '#'); if (hash) *hash = 0;
+        char cls[96], fld[96], val[64];
+        if (sscanf_s(line, " %95[^. ] . %95[^= ] = %63s", cls, (unsigned)sizeof(cls), fld, (unsigned)sizeof(fld), val, (unsigned)sizeof(val)) == 3)
+            WriteSetting(cls, fld, val, "SETTINGS: WRITE");
+    }
+    fclose(f);
+}
+
+// Generation 14: Dx12DisplaySettings' Reflex fields (13: NvidiaReflexSettings' live values and field types (for an
+// [Engine] Reflex switch).
 extern "C" __declspec(dllexport) void ProbeRun(const ProbeApi* api)
 {
     g_api = *api;
     ImgInit();
-    ApplySettings();
+    BYTE* objs[8];
+    static FieldDesc fields[256];
+    BYTE* rec = FindTypeRecord("Dx12DisplaySettings");
+    UINT16 size = 0; UINT64 rt = 0;
+    int nf = rec ? ReadFields(rec, fields, 256, &size, &rt) : 0;
+    int n = FindObjectsByType("Dx12DisplaySettings", objs, 8);
+    Log("SETTINGS: Dx12DisplaySettings: %d object%s, %d fields", n, n == 1 ? "" : "s", nf);
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < nf; ++i)
+            if (strstr(fields[i].name, "Reflex") || strstr(fields[i].name, "Latency") || strstr(fields[i].name, "Sleep"))
+            {
+                BYTE v = 0; SafeRead(objs[j] + fields[i].off, &v, 1);
+                char t[48]; TypeName(fields[i].type, t, sizeof(t));
+                Log("SETTINGS:   %p +0x%03X %s (%s) = %u", objs[j], fields[i].off, fields[i].name, t, v);
+            }
 }
