@@ -62,7 +62,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "version.lib")
 
-static const char* MOD_VERSION = "0.2.1";
+static const char* MOD_VERSION = "0.3.0";
 
 extern "C" {
 extern const int VT_GetResourceAllocationInfo, VT_CreateCommittedResource, VT_CreateHeap,
@@ -89,7 +89,7 @@ struct Config
     int  logging = 1;
     int  hitchMs = 20;
     char captureKey[32] = "F8";
-    int  suballocate = 0;
+    int  suballocate = 1;
     char toggleKey[32] = "F9";
     int  blockMB = 128;
     int  prewarmBlocks = 4;
@@ -97,15 +97,20 @@ struct Config
     int  maxPoolMB = 4096;
     int  hostBlockMB = 32;
     int  maxHostPoolMB = 512;
+    int  probe = 0;
+    struct { char cls[96], fld[96], val[64]; } engine[16];   // [Engine] Class.Field = value
+    int  nEngine = 0;
 };
 static Config g_cfg;
 
 static const char* DEFAULT_INI =
 "; Ishimura Patch - Dead Space (2023)\n"
 ";\n"
-"; 0.1.0 is a measurement build: it changes nothing in the game. It times\n"
-"; the game's D3D12 GPU memory requests and logs the frames they slow down.\n"
-"; Delete this file and relaunch to get the defaults back.\n"
+"; Fixes the traversal stutter at streaming boundaries (walking off a lift,\n"
+"; through doors, down hallways). Two parts, both on by default: [Fix]\n"
+"; changes how the game's small GPU memory requests are made, and [Engine]\n"
+"; sets one of the engine's own texture streaming options. Nothing on disk\n"
+"; is changed. Delete this file and relaunch to get the defaults back.\n"
 "\n"
 "[Logging]\n"
 "; Write a log to ishimurapatch.log (a fresh file every launch; a session's\n"
@@ -129,13 +134,13 @@ static const char* DEFAULT_INI =
 "CaptureKey = F8\n"
 "\n"
 "[Fix]\n"
-"; EXPERIMENTAL. The stutter at streaming boundaries comes from the game\n"
-"; asking Windows for hundreds of small GPU memory blocks in one frame,\n"
-"; each one a slow round trip. With this on, those small textures and\n"
-"; buffers are carved out of a few large blocks made in advance instead.\n"
-";  0 = off (the game as shipped, default)\n"
-";  1 = on\n"
-"Suballocate = 0\n"
+"; Most of the stutter comes from the game asking Windows for hundreds of\n"
+"; small GPU memory blocks in one frame, each one a slow round trip. With\n"
+"; this on, those small textures and buffers are carved out of a few large\n"
+"; blocks made in advance instead. (Lift test: worst frame ~106 -> ~18 ms.)\n"
+";  0 = off (the game as shipped)\n"
+";  1 = on (default)\n"
+"Suballocate = 1\n"
 "\n"
 "; Press this key while playing to switch Suballocate on or off (logged),\n"
 "; for comparing the two in one session. It applies to resources created\n"
@@ -159,7 +164,27 @@ static const char* DEFAULT_INI =
 "; (system memory, not graphics memory): block size (MB, 4-64) and the\n"
 "; most they may total (MB, 16-2048).\n"
 "HostBlockMB = 32\n"
-"MaxHostPoolMB = 512\n";
+"MaxHostPoolMB = 512\n"
+"\n"
+"[Engine]\n"
+"; The engine's own settings, written into the running game a few seconds\n"
+"; after it starts and kept that way (logged). One per line, as\n"
+"; Class.Field = value. Delete a line, or put ; in front of it, to leave\n"
+"; that setting as the game has it.\n"
+";\n"
+"; ForceLoadStreamingImmediate: the game normally stops a frame to finish\n"
+"; loading a texture it needs right now. Off, the frame goes on with a\n"
+"; slightly lower-detail version for a few frames until the sharp one is\n"
+"; in. With [Fix] on this takes the lift test's worst frame ~18 -> ~12 ms.\n"
+"TextureStreamingSettings.ForceLoadStreamingImmediate = 0\n"
+"\n"
+"[Settings]\n"
+"; DEVELOPMENT. Runs ishimurapatch_probe.dll (beside this file) once each\n"
+"; time it changes, from 20 seconds after the game starts: reverse-\n"
+"; engineering code that is rebuilt while the game runs. Without the file\n"
+"; this does nothing.\n"
+";  0 = off (default)   1 = on\n"
+"Probe = 0\n";
 
 static void LoadConfig()
 {
@@ -194,6 +219,27 @@ static void LoadConfig()
     g_cfg.maxPoolMB     = GetPrivateProfileIntA("Fix", "MaxPoolMB", fb.maxPoolMB, g_files.iniPath);
     g_cfg.hostBlockMB   = GetPrivateProfileIntA("Fix", "HostBlockMB", fb.hostBlockMB, g_files.iniPath);
     g_cfg.maxHostPoolMB = GetPrivateProfileIntA("Fix", "MaxHostPoolMB", fb.maxHostPoolMB, g_files.iniPath);
+    g_cfg.probe         = GetPrivateProfileIntA("Settings", "Probe", fb.probe, g_files.iniPath) ? 1 : 0;
+    {
+        // [Engine]: every "Class.Field = value" line
+        static char sec[8192];
+        DWORD len = GetPrivateProfileSectionA("Engine", sec, sizeof(sec), g_files.iniPath);
+        g_cfg.nEngine = 0;
+        for (char* p = sec; len && *p && g_cfg.nEngine < 16; p += strlen(p) + 1)
+        {
+            if (*p == ';' || *p == '#') continue;
+            auto& e = g_cfg.engine[g_cfg.nEngine];
+            char key[200] = {};
+            if (sscanf_s(p, " %199[^=] = %63s", key, (unsigned)sizeof(key), e.val, (unsigned)sizeof(e.val)) != 2) continue;
+            for (char* k = key + strlen(key); k > key && (k[-1] == ' ' || k[-1] == '\t'); ) *--k = 0;
+            char* dot = strchr(key, '.');
+            if (!dot) continue;
+            *dot = 0;
+            strncpy_s(e.cls, sizeof(e.cls), key, _TRUNCATE);
+            strncpy_s(e.fld, sizeof(e.fld), dot + 1, _TRUNCATE);
+            g_cfg.nEngine++;
+        }
+    }
     if (g_cfg.logging < 0 || g_cfg.logging > 2) g_cfg.logging = 1;
     if (g_cfg.hitchMs < 1) g_cfg.hitchMs = fb.hitchMs;
     g_cfg.suballocate = g_cfg.suballocate ? 1 : 0;
@@ -280,6 +326,8 @@ static void LogAt(LONGLONG stampTicks, const char* fmt, ...)
     if (!g_cfg.logging || !g_files.logPath[0]) return;
     va_list ap; va_start(ap, fmt); LogWriteAt(stampTicks, fmt, ap); va_end(ap);
 }
+
+#include "frostbite.h"   // type records, memory scans, live settings objects
 
 // ----------------------------------------------------------------------------
 // Threads: a slot per thread that calls a hook, holding its name and this
@@ -1210,12 +1258,124 @@ static DWORD WINAPI PresentHookThread(LPVOID param)
 }
 
 // ----------------------------------------------------------------------------
+// [Engine] settings: once the game has its device (config parsed, settings
+// objects built), each "Class.Field = value" is resolved (frostbite.h finds
+// the live objects by shape) and written, retrying for two minutes while the
+// objects appear. Then every 2 s each is checked and restored if the engine
+// changed it back (logged; a setting restored 50 times is given up on).
+// Lift A/B, 10/18: with [Fix] on, ForceLoadStreamingImmediate = 0 took the
+// worst frame per pass from 14.5-20.5 ms to 11.5-12.5 ms over five passes
+// each; a 1 ms ForceLoadStreamingImmediateQuantumMs instead spiked to 22.9,
+// and splitting mesh streaming work over 4 frames made no real difference.
+// ----------------------------------------------------------------------------
+static bool DeviceReady();   // the game's D3D12 device has been found (below)
+static DWORD WINAPI EngineThread(LPVOID)
+{
+    static SettingRef refs[16];
+    static int restored[16];
+    bool ok[16] = {};
+    for (int i = 0; i < g_cfg.nEngine; ++i)
+    {
+        refs[i] = SettingRef();
+        strncpy_s(refs[i].cls, sizeof(refs[i].cls), g_cfg.engine[i].cls, _TRUNCATE);
+        strncpy_s(refs[i].fld, sizeof(refs[i].fld), g_cfg.engine[i].fld, _TRUNCATE);
+        strncpy_s(refs[i].val, sizeof(refs[i].val), g_cfg.engine[i].val, _TRUNCATE);
+    }
+    for (int w = 0; w < 600 && !DeviceReady(); ++w) Sleep(100);
+    Sleep(5000);
+    ImgInit();
+    int left = g_cfg.nEngine;
+    for (int attempt = 0; attempt < 24 && left; ++attempt, Sleep(5000))
+        for (int i = 0; i < g_cfg.nEngine; ++i)
+        {
+            if (ok[i]) continue;
+            bool last = attempt == 23;
+            if (!ResolveSetting(refs[i], "ENGINE", !last)) continue;
+            ok[i] = true; --left;
+            int n = ApplySetting(refs[i], "ENGINE: set");
+            if (n == 0) Log("ENGINE: %s.%s already %s", refs[i].cls, refs[i].fld, refs[i].val);
+        }
+    for (int i = 0; i < g_cfg.nEngine; ++i)
+        if (!ok[i]) Log("ENGINE: %s.%s NOT applied (no live object found in 2 minutes) - the game keeps its own value",
+                        refs[i].cls, refs[i].fld);
+    if (left == g_cfg.nEngine) return 0;
+    for (;; Sleep(2000))
+        for (int i = 0; i < g_cfg.nEngine; ++i)
+        {
+            if (!ok[i] || restored[i] >= 50) continue;
+            int n = ApplySetting(refs[i], "ENGINE: restored");
+            if (n < 0)
+            {
+                Log("ENGINE: %s.%s object no longer readable - finding it again", refs[i].cls, refs[i].fld);
+                if (ResolveSetting(refs[i], "ENGINE")) ApplySetting(refs[i], "ENGINE: set");
+                continue;
+            }
+            if (n > 0 && ++restored[i] >= 50)
+                Log("ENGINE: %s.%s keeps being reset by the game - no longer enforced", refs[i].cls, refs[i].fld);
+        }
+}
+
+// ----------------------------------------------------------------------------
+// The development probe: ishimurapatch_probe.dll beside the .asi holds
+// reverse-engineering code that changes often (now: the settings inspector,
+// see probe.cpp). This thread watches the file; each new version is copied
+// to %TEMP%, loaded, run once (ProbeRun) and unloaded, so a probe runs in
+// the live game without a restart. [Settings] Probe = 1 turns it on.
+// ----------------------------------------------------------------------------
+struct ProbeApi
+{
+    void (*log)(const char* line);
+    LONGLONG qpcFreq;
+};
+typedef void (*PFN_ProbeRun)(const ProbeApi*);
+static void ProbeLog(const char* line) { Log("%s", line); }
+
+static DWORD WINAPI ProbeWatchThread(LPVOID)
+{
+    char src[MAX_PATH];
+    strncpy_s(src, sizeof(src), g_files.logPath, _TRUNCATE);
+    char* slash = strrchr(src, '\\');
+    if (!slash) return 0;
+    strcpy_s(slash + 1, src + sizeof(src) - slash - 1, "ishimurapatch_probe.dll");
+    Sleep(20000);   // past the boot-time config parse
+    FILETIME last = {};
+    int gen = 0;
+    for (;; Sleep(1000))
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (!GetFileAttributesExA(src, GetFileExInfoStandard, &fa) || !CompareFileTime(&fa.ftLastWriteTime, &last)) continue;
+        Sleep(500);   // let whoever is writing it finish
+        if (!GetFileAttributesExA(src, GetFileExInfoStandard, &fa)) continue;
+        last = fa.ftLastWriteTime;
+        char dst[MAX_PATH];
+        GetTempPathA(MAX_PATH, dst);
+        char name[64];
+        _snprintf_s(name, sizeof(name), _TRUNCATE, "ishimurapatch_probe_%lu_%d.dll", GetCurrentProcessId(), ++gen);
+        strcat_s(dst, sizeof(dst), name);
+        if (!CopyFileA(src, dst, FALSE)) { Log("PROBE: copy FAILED (%lu)", GetLastError()); continue; }
+        HMODULE h = LoadLibraryA(dst);
+        PFN_ProbeRun run = h ? (PFN_ProbeRun)GetProcAddress(h, "ProbeRun") : NULL;
+        Log("PROBE: generation %d %s", gen, run ? "loaded, running" : "could not be loaded");
+        LONGLONG t0 = Now();
+        if (run)
+        {
+            ProbeApi api = { ProbeLog, g_qpcFreq };
+            run(&api);
+        }
+        if (h) FreeLibrary(h);
+        DeleteFileA(dst);
+        Log("PROBE: generation %d finished in %.0f ms, unloaded", gen, Ms(Now() - t0));
+    }
+}
+
+// ----------------------------------------------------------------------------
 // The device: found when the game creates it, or created by us if the game
 // beat the hook (D3D12 returns the one device per adapter either way).
 // ----------------------------------------------------------------------------
 typedef HRESULT (WINAPI* PFN_D3D12CreateDevice)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
 static PFN_D3D12CreateDevice o_D3D12CreateDevice;
 static volatile LONG g_devicePatched = 0;
+static bool DeviceReady() { return g_devicePatched != 0; }
 
 static void PatchDevice(ID3D12Device* dev, const char* how)
 {
@@ -1534,7 +1694,7 @@ static DWORD WINAPI InitThread(LPVOID)
     char ts[64] = {0};
     ctime_s(ts, sizeof(ts), &now);
     if (ts[0]) { size_t n = strlen(ts); if (n && ts[n - 1] == '\n') ts[n - 1] = '\0'; }
-    Log("--- Ishimura Patch v%s (measurement build) --- %s", MOD_VERSION, ts);
+    Log("--- Ishimura Patch v%s --- %s", MOD_VERSION, ts);
     Log(g_files.iniCreated ? "ishimurapatch.ini not found - created with defaults"
                            : "config loaded from ishimurapatch.ini");
     Log("config: Logging = %d | HitchMs = %d | CaptureKey = %s", g_cfg.logging, g_cfg.hitchMs,
@@ -1543,6 +1703,9 @@ static DWORD WINAPI InitThread(LPVOID)
         " | HostBlockMB = %d | MaxHostPoolMB = %d",
         g_cfg.suballocate, g_cfg.toggleKey[0] ? g_cfg.toggleKey : "(off)", g_cfg.blockMB, g_cfg.prewarmBlocks,
         g_cfg.maxPoolMB, g_cfg.maxResourceKB, g_cfg.hostBlockMB, g_cfg.maxHostPoolMB);
+    Log("config: Probe = %d | [Engine] %d setting%s", g_cfg.probe, g_cfg.nEngine, g_cfg.nEngine == 1 ? "" : "s");
+    for (int i = 0; i < g_cfg.nEngine; ++i)
+        Log("config:   %s.%s = %s", g_cfg.engine[i].cls, g_cfg.engine[i].fld, g_cfg.engine[i].val);
     {
         char exe[MAX_PATH] = {};
         GetModuleFileNameA(NULL, exe, MAX_PATH);
@@ -1578,6 +1741,8 @@ static DWORD WINAPI InitThread(LPVOID)
     if (g_cfg.logging == 2 && g_ring)
         if ((t = CreateThread(NULL, 0, WriterThread, NULL, 0, NULL))) CloseHandle(t);
     if ((t = CreateThread(NULL, 0, KeyThread, NULL, 0, NULL))) CloseHandle(t);
+    if (g_cfg.probe && (t = CreateThread(NULL, 0, ProbeWatchThread, NULL, 0, NULL))) CloseHandle(t);
+    if (g_cfg.nEngine && (t = CreateThread(NULL, 0, EngineThread, NULL, 0, NULL))) CloseHandle(t);
     return 0;
 }
 
