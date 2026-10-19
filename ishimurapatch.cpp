@@ -99,6 +99,7 @@ struct Config
     int  maxHostPoolMB = 512;
     int  probe = 0;
     int  reflex = 0;
+    int  dataReadMBs = 0;
     struct { char cls[96], fld[96], val[64]; } engine[16];   // [Engine] Class.Field = value
     int  nEngine = 0;
 };
@@ -210,6 +211,18 @@ static const char* DEFAULT_INI =
 "; letter; empty = off.\n"
 "CaptureKey = F8\n"
 "\n"
+"\n"
+"; DEVELOPMENT (live). Cap how fast the game reads its own data archives,\n"
+"; in MB/s. At a streaming boundary the engine decompresses the new area\n"
+"; on the same worker threads the frame needs; capping the reads makes the\n"
+"; chunks arrive over more frames, so that work is spread out too. This is\n"
+"; what installing the game on a slow drive does, applied after the drive,\n"
+"; so only the game's own archives are affected. Reads are only delayed -\n"
+"; the data itself is never touched. Too low and textures arrive late. The\n"
+"; rate reached can land a little under the number set here.\n"
+"; 0 = off (default), or 25-8000\n"
+"DataReadMBs = 0\n"
+"\n"
 "; DEVELOPMENT (read at launch). Runs ishimurapatch_probe.dll (beside this\n"
 "; file) once each time it changes, from 20 seconds after the game starts:\n"
 "; reverse-engineering code that is rebuilt while the game runs. Without\n"
@@ -227,6 +240,7 @@ static void ReadConfig(Config& c, const Config& fb)
     const char* ini = g_files.iniPath;
     c.suballocate   = GetPrivateProfileIntA("Fix", "Suballocate", fb.suballocate, ini) ? 1 : 0;
     c.reflex        = GetPrivateProfileIntA("Reflex", "Reflex", fb.reflex, ini) ? 1 : 0;
+    c.dataReadMBs   = GetPrivateProfileIntA("Advanced", "DataReadMBs", fb.dataReadMBs, ini);
     GetPrivateProfileStringA("Fix", "ToggleKey", fb.toggleKey, c.toggleKey, sizeof(c.toggleKey), ini);
     c.blockMB       = GetPrivateProfileIntA("Fix", "BlockMB", fb.blockMB, ini);
     c.prewarmBlocks = GetPrivateProfileIntA("Fix", "PrewarmBlocks", fb.prewarmBlocks, ini);
@@ -269,6 +283,7 @@ static void ReadConfig(Config& c, const Config& fb)
     if (c.hostBlockMB < 4 || c.hostBlockMB > 64) c.hostBlockMB = fb.hostBlockMB;
     if (c.maxHostPoolMB < 16 || c.maxHostPoolMB > 2048) c.maxHostPoolMB = fb.maxHostPoolMB;
     if (c.maxHostPoolMB < c.hostBlockMB) c.maxHostPoolMB = c.hostBlockMB;
+    if (c.dataReadMBs && (c.dataReadMBs < 25 || c.dataReadMBs > 8000)) c.dataReadMBs = fb.dataReadMBs;
 }
 
 static void LoadConfig()
@@ -1242,6 +1257,99 @@ static HRESULT STDMETHODCALLTYPE h_Present1(IDXGISwapChain1* sc, UINT sync, UINT
 // code chain one after another whatever order they go in.
 typedef HRESULT (WINAPI* PFN_CreateDXGIFactory2)(UINT, REFIID, void**);
 // ----------------------------------------------------------------------------
+// The data read cap ([Advanced] DataReadMBs). At a streaming boundary the engine
+// decompresses the new area's bundles as jobs on the same 14 worker threads
+// the frame needs (~7.3 cores of work against 4.9 normally, ETW 10/19), and
+// the settings that would spread that work are read once at startup. This
+// caps how fast the game's .cas archives are read instead, so the chunks
+// arrive over more frames and their decompression is queued over more frames
+// too. It is the measured mechanism behind installing the game on a slow
+// drive, applied after the drive so nothing else is slowed.
+//
+// A read is only ever DELAYED: nothing is buffered, copied or reordered, and
+// the original call is made with every argument unchanged, so the data the
+// game receives cannot differ. 0 = off (the hook passes everything straight
+// through). The rate is live: it is read per call.
+// ----------------------------------------------------------------------------
+struct IoStatusLite { union { LONG Status; PVOID Pointer; }; ULONG_PTR Information; };
+typedef LONG (NTAPI* PFN_NtReadFile)(HANDLE, HANDLE, PVOID, PVOID, IoStatusLite*, PVOID, ULONG,
+                                     LARGE_INTEGER*, ULONG*);
+static PFN_NtReadFile o_NtReadFile = NULL;
+
+static const int  THROTTLE_MIN_BYTES = 32 * 1024;   // metadata reads are left alone
+static const int  THROTTLE_MAX_SLEEP = 25;          // ms, per read
+
+static volatile LONGLONG g_thNextFree = 0;
+static volatile LONGLONG g_thReads = 0, g_thBytes = 0, g_thDelayTicks = 0, g_thPassed = 0;
+static __declspec(thread) int t_inReadHook = 0;
+
+// Asked per read, not cached: a closed handle's value is reused, and a stale
+// answer slowed an unrelated file in the out-of-game test (10/19). Only reads
+// of at least THROTTLE_MIN_BYTES ask, so the cost is bounded.
+static bool CasHandle(HANDLE h)
+{
+    char path[MAX_PATH];
+    DWORD n = GetFinalPathNameByHandleA(h, path, MAX_PATH, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    return n > 4 && n < MAX_PATH && !_stricmp(path + n - 4, ".cas");
+}
+
+static LONG NTAPI h_NtReadFile(HANDLE file, HANDLE event, PVOID apc, PVOID apcCtx, IoStatusLite* iosb,
+                               PVOID buffer, ULONG length, LARGE_INTEGER* offset, ULONG* key)
+{
+    int rate = g_cfg.dataReadMBs;
+    if (rate > 0 && length >= THROTTLE_MIN_BYTES && !t_inReadHook)
+    {
+        ++t_inReadHook;                     // GetFinalPathNameByHandle must not re-enter
+        bool cas = CasHandle(file);
+        --t_inReadHook;
+        if (cas)
+        {
+            // one shared schedule: each read is owed length/rate of wall time
+            LONGLONG need = (LONGLONG)((double)length / (rate * 1048576.0) * (double)g_qpcFreq);
+            LONGLONG start, now;
+            for (;;)
+            {
+                now = Now();
+                LONGLONG cur = g_thNextFree;
+                start = cur > now ? cur : now;
+                if (InterlockedCompareExchange64(&g_thNextFree, start + need, cur) == cur) break;
+            }
+            double ms = Ms(start - now);
+            // Sleep rounds up to a whole millisecond, so ask for half a one
+            // less; the schedule is cumulative, so the rest is made up on the
+            // reads that follow.
+            if (ms > 1.0)
+            {
+                if (ms > THROTTLE_MAX_SLEEP) ms = THROTTLE_MAX_SLEEP;
+                Sleep((DWORD)(ms - 0.5));
+                InterlockedAdd64(&g_thDelayTicks, start - now);
+            }
+            InterlockedIncrement64(&g_thReads);
+            InterlockedAdd64(&g_thBytes, length);
+        }
+        else InterlockedIncrement64(&g_thPassed);
+    }
+    return o_NtReadFile(file, event, apc, apcCtx, iosb, buffer, length, offset, key);
+}
+
+// Expires the handle classifications and reports what the cap did.
+static DWORD WINAPI ThrottleThread(LPVOID)
+{
+    LONGLONG reads = 0, bytes = 0, delay = 0;
+    for (int tick = 0;; ++tick)
+    {
+        Sleep(5000);
+        if (!g_cfg.dataReadMBs) continue;
+        LONGLONG r = g_thReads, b = g_thBytes, d = g_thDelayTicks;
+        if (r == reads) continue;
+        Log("THROTTLE: %lld MB of game data in %lld reads in the last 5 s, %.0f ms of waiting (cap %d MB/s);"
+            " %lld larger reads of other files passed straight through",
+            (b - bytes) >> 20, r - reads, Ms(d - delay), g_cfg.dataReadMBs, g_thPassed);
+        reads = r; bytes = b; delay = d;
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Reflex. The game runs NVIDIA Reflex through Streamline 1.3, which loads its
 // plugins from the game folder (sl.reflex.dll among them). The game asks for
 // low-latency mode 0, off (slSetFeatureConstants, logged by 0.3.2-dev, 10/19),
@@ -1915,6 +2023,12 @@ static void LoadConfigLive()
         Log("config: Logging = %d (live)", g_cfg.logging);
     }
     if (c.hitchMs != g_cfg.hitchMs) { g_cfg.hitchMs = c.hitchMs; Log("config: HitchMs = %d (live)", g_cfg.hitchMs); }
+    if (c.dataReadMBs != g_cfg.dataReadMBs)
+    {
+        g_cfg.dataReadMBs = c.dataReadMBs;
+        if (c.dataReadMBs) Log("FIX: data reads capped at %d MB/s (live)", c.dataReadMBs);
+        else Log("FIX: data read cap off (live)");
+    }
     if (c.reflex != g_cfg.reflex)
         Log("config: Reflex = %d - read at launch, so it takes effect next launch", c.reflex);
     if (strcmp(c.captureKey, g_cfg.captureKey))
@@ -2051,7 +2165,7 @@ static DWORD WINAPI InitThread(LPVOID)
         " | HostBlockMB = %d | MaxHostPoolMB = %d",
         g_cfg.suballocate, g_cfg.toggleKey[0] ? g_cfg.toggleKey : "(off)", g_cfg.blockMB, g_cfg.prewarmBlocks,
         g_cfg.maxPoolMB, g_cfg.maxResourceKB, g_cfg.hostBlockMB, g_cfg.maxHostPoolMB);
-    Log("config: Reflex = %d", g_cfg.reflex);
+    Log("config: Reflex = %d | DataReadMBs = %d", g_cfg.reflex, g_cfg.dataReadMBs);
     Log("config: Probe = %d | [Engine] %d setting%s", g_cfg.probe, g_cfg.nEngine, g_cfg.nEngine == 1 ? "" : "s");
     for (int i = 0; i < g_cfg.nEngine; ++i)
         Log("config:   %s.%s = %s", g_cfg.engine[i].cls, g_cfg.engine[i].fld, g_cfg.engine[i].val);
@@ -2081,6 +2195,8 @@ static DWORD WINAPI InitThread(LPVOID)
             Log("note: D3D12Core.dll already loaded at init - the device may predate the hook (fallback armed)");
         HookExport("d3d12.dll", "D3D12CreateDevice", (void*)h_D3D12CreateDevice,
                    (void**)&o_D3D12CreateDevice, "D3D12CreateDevice");
+        HookExport("ntdll.dll", "NtReadFile", (void*)h_NtReadFile, (void**)&o_NtReadFile,
+                   "file reads (NtReadFile, for [Advanced] DataReadMBs)");
         if (!g_cfg.reflex)
         {
             if (GetModuleHandleA("sl.reflex.dll")) Log("REFLEX: sl.reflex.dll already loaded - too late to keep it out this session");
@@ -2093,6 +2209,7 @@ static DWORD WINAPI InitThread(LPVOID)
     HANDLE t;
     if (g_cfg.nEngine && (t = CreateThread(NULL, 0, EarlyEngineThread, NULL, 0, NULL))) CloseHandle(t);
     if ((t = CreateThread(NULL, 0, FallbackThread, NULL, 0, NULL))) CloseHandle(t);
+    if (o_NtReadFile && (t = CreateThread(NULL, 0, ThrottleThread, NULL, 0, NULL))) CloseHandle(t);
     if (g_cfg.logging == 2 && g_ring)
         if ((t = CreateThread(NULL, 0, WriterThread, NULL, 0, NULL))) CloseHandle(t);
     if ((t = CreateThread(NULL, 0, KeyThread, NULL, 0, NULL))) CloseHandle(t);
