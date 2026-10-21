@@ -57,10 +57,13 @@
 #include <string.h>
 #include <share.h>
 #include <time.h>
+#include <math.h>
+#include <mmsystem.h>
 #include "third_party/minhook/include/MinHook.h"
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "version.lib")
+#pragma comment(lib, "winmm.lib")   // PlaySound, for the toggle chime
 
 static const char* MOD_VERSION = "0.3.3";
 
@@ -255,6 +258,7 @@ static const char* DEFAULT_INI =
 "; 0 = off (default), 1 = on\n"
 "RaiseDirectQueue = 0\n"
 "\n"
+
 "; DEVELOPMENT (read at launch). Runs ishimurapatch_probe.dll (beside this\n"
 "; file) once each time it changes, from 20 seconds after the game starts:\n"
 "; reverse-engineering code that is rebuilt while the game runs. Without\n"
@@ -2313,12 +2317,49 @@ static bool IniSetValue(const char* section, const char* key, const char* value)
     return ok;
 }
 
-// Soft rising (on) or falling (off) chime, off the key thread.
-static DWORD WINAPI ChimeThread(LPVOID on)
+// Soft rising (on) or falling (off) chime: two short sine notes, made once as
+// a small WAV in memory and played through the normal Windows audio path, so
+// it comes out of the game's sound device at its volume. (Beep() can go to
+// another device, follow a muted "System sounds", or be off altogether when
+// a tune-up tool has disabled the beep driver.)
+struct ChimeNote { double hz; int ms; };
+
+static BYTE* MakeChime(const ChimeNote* notes, int count)
 {
-    if (on) { Beep(392, 110); Beep(587, 160); }
-    else    { Beep(587, 110); Beep(392, 160); }
-    return 0;
+    const int RATE = 44100, FADE = RATE * 8 / 1000;   // 8 ms fades: no clicks
+    const double LOUDNESS = 0.22;                      // of full scale: soft
+    int samples = 0;
+    for (int n = 0; n < count; ++n) samples += RATE * notes[n].ms / 1000;
+    DWORD dataBytes = (DWORD)samples * 2, totalBytes = 44 + dataBytes;
+    BYTE* wav = (BYTE*)malloc(totalBytes);
+    if (!wav) return NULL;
+    // RIFF header: 16-bit mono PCM
+    DWORD header[11] = { 'FFIR', totalBytes - 8, 'EVAW', ' tmf', 16, 0x00010001, (DWORD)RATE, (DWORD)RATE * 2,
+                         0x00100002, 'atad', dataBytes };
+    memcpy(wav, header, 44);
+    short* pcm = (short*)(wav + 44);
+    for (int n = 0, i = 0; n < count; ++n)
+    {
+        int length = RATE * notes[n].ms / 1000;
+        for (int k = 0; k < length; ++k, ++i)
+        {
+            double envelope = min(1.0, min((double)k / FADE, (double)(length - k) / FADE));
+            pcm[i] = (short)(sin(6.283185307179586 * notes[n].hz * k / RATE) * envelope * LOUDNESS * 32767);
+        }
+    }
+    return wav;
+}
+
+// Called from the key thread only; plays without waiting.
+static void PlayChime(bool on)
+{
+    static const ChimeNote RISING[] = { { 392, 110 }, { 587, 160 } };
+    static const ChimeNote FALLING[] = { { 587, 110 }, { 392, 160 } };
+    static BYTE* rising = NULL;
+    static BYTE* falling = NULL;
+    BYTE*& wav = on ? rising : falling;
+    if (!wav) wav = MakeChime(on ? RISING : FALLING, 2);
+    if (wav) PlaySoundA((LPCSTR)wav, NULL, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
 }
 
 // The capture key (Logging 2) and the fix's toggle key (any level). Both are
@@ -2344,8 +2385,7 @@ static DWORD WINAPI KeyThread(LPVOID)
                 // updated first, so the reload this save triggers is a no-op.
                 g_cfg.suballocate = now;
                 bool saved = IniSetValue("Fix", "Suballocate", now ? "1" : "0");
-                HANDLE ch = CreateThread(NULL, 0, ChimeThread, (LPVOID)(INT_PTR)now, 0, NULL);
-                if (ch) CloseHandle(ch);
+                PlayChime(now != 0);
                 char sum[256];
                 SubSummary(sum, sizeof(sum));
                 Log("FIX: suballocation switched %s by the player%s | %s | %ld live, %ld made, %ld fell back",
