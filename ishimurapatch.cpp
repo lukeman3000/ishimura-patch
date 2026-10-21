@@ -62,7 +62,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "version.lib")
 
-static const char* MOD_VERSION = "0.3.2";
+static const char* MOD_VERSION = "0.3.3";
 
 extern "C" {
 extern const int VT_GetResourceAllocationInfo, VT_CreateCommittedResource, VT_CreateHeap,
@@ -139,8 +139,10 @@ static const char* DEFAULT_INI =
 "; 1 = fixed (default), 0 = stock game behavior\n"
 "Suballocate = 1\n"
 "\n"
-"; Press this key while playing to switch Suballocate on or off (logged),\n"
-"; for comparing the two in one session. F1-F12 or a letter; empty = off.\n"
+"; Press this key while playing to switch Suballocate on or off, for\n"
+"; comparing the two in one session. A rising chime means on, a falling one\n"
+"; off, and the new value is saved to Suballocate above. F1-F12 or a\n"
+"; letter; empty = off.\n"
 "ToggleKey = F9\n"
 "\n"
 "; (read at launch) At a streaming boundary the game's copy queue uploads\n"
@@ -2256,6 +2258,69 @@ static DWORD WINAPI CaptureLog(LPVOID param)
     return 0;
 }
 
+// Rewrites one "Key = value" line in a section of the ini, keeping the rest
+// of the file (comments, spacing) as it is. False if the line isn't there.
+static bool IniSetValue(const char* section, const char* key, const char* value)
+{
+    FILE* f = NULL;
+    if (fopen_s(&f, g_files.iniPath, "rb") != 0 || !f) return false;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0 || size > (1 << 20)) { fclose(f); return false; }
+    char* text = (char*)malloc(size + 1);
+    if (!text) { fclose(f); return false; }
+    size = (long)fread(text, 1, size, f);
+    text[size] = 0;
+    fclose(f);
+
+    size_t keyLen = strlen(key), secLen = strlen(section);
+    bool inSection = false;
+    char* hit = NULL;
+    for (char* line = text; *line; )
+    {
+        char* end = strchr(line, '\n');
+        char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '[')
+            inSection = _strnicmp(p + 1, section, secLen) == 0 && p[1 + secLen] == ']';
+        else if (inSection && _strnicmp(p, key, keyLen) == 0 && (p[keyLen] == ' ' || p[keyLen] == '\t' || p[keyLen] == '='))
+        { hit = p; break; }
+        if (!end) break;
+        line = end + 1;
+    }
+    bool ok = false;
+    if (hit)
+    {
+        // keep everything up to and including "= " and the line's ending
+        char* eq = strchr(hit, '=');
+        char* eol = hit + strcspn(hit, "\r\n");
+        if (eq && eq < eol)
+        {
+            char* v = eq + 1;
+            while (*v == ' ' || *v == '\t') ++v;
+            if (fopen_s(&f, g_files.iniPath, "wb") == 0 && f)
+            {
+                fwrite(text, 1, v - text, f);
+                fputs(value, f);
+                fputs(eol, f);
+                fclose(f);
+                ok = true;
+            }
+        }
+    }
+    free(text);
+    return ok;
+}
+
+// Soft rising (on) or falling (off) chime, off the key thread.
+static DWORD WINAPI ChimeThread(LPVOID on)
+{
+    if (on) { Beep(392, 110); Beep(587, 160); }
+    else    { Beep(587, 110); Beep(392, 160); }
+    return 0;
+}
+
 // The capture key (Logging 2) and the fix's toggle key (any level). Both are
 // looked up again each poll, so a live reload changes them.
 static DWORD WINAPI KeyThread(LPVOID)
@@ -2274,10 +2339,18 @@ static DWORD WINAPI KeyThread(LPVOID)
             {
                 LONG now = !g_sub.on;
                 InterlockedExchange(&g_sub.on, now);
+                // Saved to the ini too, so the file always says what's running
+                // and the next launch starts the same way. The config is
+                // updated first, so the reload this save triggers is a no-op.
+                g_cfg.suballocate = now;
+                bool saved = IniSetValue("Fix", "Suballocate", now ? "1" : "0");
+                HANDLE ch = CreateThread(NULL, 0, ChimeThread, (LPVOID)(INT_PTR)now, 0, NULL);
+                if (ch) CloseHandle(ch);
                 char sum[256];
                 SubSummary(sum, sizeof(sum));
-                Log("FIX: suballocation switched %s by the player | %s | %ld live, %ld made, %ld fell back",
-                    now ? "ON" : "OFF", sum, g_sub.live, g_sub.made, g_sub.fellBack);
+                Log("FIX: suballocation switched %s by the player%s | %s | %ld live, %ld made, %ld fell back",
+                    now ? "ON" : "OFF", saved ? " (saved to the ini)" : " (ini not updated: no Suballocate line in [Fix])",
+                    sum, g_sub.live, g_sub.made, g_sub.fellBack);
                 if (now && g_sub.growEvent) SetEvent(g_sub.growEvent);
             }
         }
