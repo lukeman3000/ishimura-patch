@@ -9,7 +9,15 @@ set "PATH=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer;%PATH%"
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 cd /d "%~dp0"
 if not exist dist mkdir dist
-cl /nologo /LD /O2 /MT /EHsc /W3 /std:c++17 /Fodist\ /Fedist\ishimurapatch.asi ^
+rem The build stamp in the log's first line: the commit built from, and
+rem whether the working copy had uncommitted changes. The version number
+rem itself (MOD_VERSION) only changes when a version is released.
+set "BUILD_ID=no git"
+for /f %%h in ('git rev-parse --short HEAD 2^>nul') do set "BUILD_ID=%%h"
+git diff --quiet HEAD -- 2>nul
+if errorlevel 1 if not "%BUILD_ID%"=="no git" set "BUILD_ID=%BUILD_ID% + local changes"
+> dist\build_id.h echo #define BUILD_ID "%BUILD_ID%"
+cl /nologo /LD /O2 /MT /EHsc /W3 /std:c++17 /Idist /Fodist\ /Fedist\ishimurapatch.asi ^
    ishimurapatch.cpp vtindex.c ^
    third_party\minhook\src\hook.c third_party\minhook\src\buffer.c ^
    third_party\minhook\src\trampoline.c third_party\minhook\src\hde\hde64.c || exit /b 1

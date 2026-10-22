@@ -65,7 +65,16 @@
 #pragma comment(lib, "version.lib")
 #pragma comment(lib, "winmm.lib")   // PlaySound, for the toggle chime
 
-static const char* MOD_VERSION = "0.3.3";
+// The version only changes when a version is released. Which build this is
+// - the commit it was built from, uncommitted changes, when - comes from
+// build.bat (build_id.h) and the compiler, so every log names its exact build.
+static const char* MOD_VERSION = "0.3.5";
+#if __has_include("build_id.h")
+#include "build_id.h"
+#else
+#define BUILD_ID "unknown"
+#endif
+static const char* BUILD_STAMP = BUILD_ID ", " __DATE__ " " __TIME__;
 
 extern "C" {
 extern const int VT_GetResourceAllocationInfo, VT_CreateCommittedResource, VT_CreateHeap,
@@ -2572,7 +2581,7 @@ static DWORD WINAPI InitThread(LPVOID)
     char ts[64] = {0};
     ctime_s(ts, sizeof(ts), &now);
     if (ts[0]) { size_t n = strlen(ts); if (n && ts[n - 1] == '\n') ts[n - 1] = '\0'; }
-    Log("--- Ishimura Patch v%s --- %s", MOD_VERSION, ts);
+    Log("--- Ishimura Patch v%s (build %s) --- %s", MOD_VERSION, BUILD_STAMP, ts);
     Log(g_files.iniCreated ? "ishimurapatch.ini not found - created with defaults"
                            : "config loaded from ishimurapatch.ini");
     Log("config: Logging = %d | HitchMs = %d | CaptureKey = %s", g_cfg.logging, g_cfg.hitchMs,
