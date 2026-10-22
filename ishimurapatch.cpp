@@ -647,11 +647,21 @@ static PFN_ENQ  o_Enqueue;
 // Suballocation: 64 KB pages in large heaps, one bitmap per heap, first fit.
 // Three pools, one per heap type the game makes small committed resources
 // in: DEFAULT (GPU-only: textures and buffers), UPLOAD and READBACK (CPU-
-// visible: buffers only, the only kind D3D12 allows there). Heaps are never
-// released; each pool stops growing at its cap and falls back to committed.
-// A grower thread keeps a block's worth of free space in every pool so a
-// burst never waits for a new heap (0.2.0 added blocks mid-pass, at ~4 ms
-// each); a pool that still runs dry makes one itself, outside the lock.
+// visible: buffers only, the only kind D3D12 allows there). Each pool stops
+// growing at its cap and falls back to committed. A grower thread keeps a
+// block's worth of free space in every pool so a burst never waits for a new
+// heap (0.2.0 added blocks mid-pass, at ~4 ms each); a pool that still runs
+// dry makes one itself, outside the lock.
+//
+// The pools' heaps hold the device, so they must not outlive the game's use
+// of it: after a device-removed error the game destroys everything and makes
+// a new device, and while anything still holds the old one D3D12 hands that
+// broken device back. So each queue the game makes carries a watcher, and
+// when the last one on the pools' device is destroyed (a reset, or the game
+// closing) the pools let go of their heaps ("retire"). A block that still has
+// pooled resources in it keeps its bookkeeping until the last one goes (D3D12
+// keeps the heap alive for them meanwhile). The next resource the game
+// creates on a device with live queues moves the pools there.
 // ----------------------------------------------------------------------------
 static const UINT64 SUB_PAGE = 65536;
 static const int SUB_MAX_BLOCKS = 256;
@@ -659,9 +669,10 @@ struct SubPool;
 struct SubBlock
 {
     SubPool*    pool;
-    ID3D12Heap* heap;
+    ID3D12Heap* heap;        // null once retired
     UINT64*     bits;        // 1 = page in use
     UINT        pages, freePages;
+    bool        retired;     // out of its pool; deleted when its last page is freed
 };
 enum PoolId { POOL_DEFAULT, POOL_UPLOAD, POOL_READBACK, POOL_COUNT };
 struct SubPool
@@ -675,14 +686,22 @@ struct SubPool
     volatile LONG    count;
     volatile LONG64  totalPages, freePages;
 };
+// The game's live queues per device, from the queue watchers.
+struct DeviceQueues { ID3D12Device* dev; LONG live; };
+static const int SUB_MAX_DEVICES = 8;
+
 struct SubState
 {
     SRWLOCK        lock = SRWLOCK_INIT;
     SubPool        pools[POOL_COUNT] = {};
     volatile LONG  on = 0;
+    // The device the pools are on; null when retired. Not a reference: while
+    // set, the pools' heaps or the game's watched queues hold it, and it is
+    // cleared (under the lock) before either lets go.
     ID3D12Device*  dev = NULL;
     bool           tierOk = false;
     HANDLE         growEvent = NULL;
+    DeviceQueues   devices[SUB_MAX_DEVICES] = {};
     volatile LONG  live = 0, made = 0, fellBack = 0, heapFails = 0, capped = 0;
 };
 static SubState g_sub;
@@ -730,31 +749,41 @@ static void SubSummary(char* out, size_t n)
     }
 }
 
-// Makes one heap outside the lock, then adds it under the lock.
+// Makes one heap outside the lock, then adds it under the lock - if the pools
+// are still on the device it was made on (they may have retired meanwhile).
 static SubBlock* SubGrow(SubPool& p, const char* why)
 {
-    if (!o_CH || !g_sub.dev || p.count >= p.maxBlocks) return NULL;
+    AcquireSRWLockExclusive(&g_sub.lock);
+    ID3D12Device* dev = g_sub.dev;
+    if (dev) dev->AddRef();   // alive while set (see SubState); held across the unlocked heap creation
+    ReleaseSRWLockExclusive(&g_sub.lock);
+    if (!o_CH || !dev || p.count >= p.maxBlocks)
+    {
+        if (dev) dev->Release();
+        return NULL;
+    }
     D3D12_HEAP_DESC hd = {};
     hd.SizeInBytes = p.blockBytes;
     hd.Properties.Type = p.type;
     hd.Flags = p.heapFlags;   // DEFAULT on tier 2: buffers and all textures together
     ID3D12Heap* heap = NULL;
     LONGLONG t0 = Now();
-    if (FAILED(o_CH(g_sub.dev, &hd, IID_PPV_ARGS(&heap))) || !heap)
+    if (FAILED(o_CH(dev, &hd, IID_PPV_ARGS(&heap))) || !heap)
     {
+        dev->Release();
         InterlockedIncrement(&g_sub.heapFails);
         Log("SUB: %s block FAILED to create (%llu MB) - that pool falls back to committed until one fits", p.name, p.blockBytes >> 20);
         return NULL;
     }
     double ms = Ms(Now() - t0);
-    SubBlock* b = new SubBlock;
+    SubBlock* b = new SubBlock();
     b->pool = &p;
     b->heap = heap;
     b->pages = (UINT)(p.blockBytes / SUB_PAGE);
     b->freePages = b->pages;
     b->bits = new UINT64[(b->pages + 63) / 64]();
     AcquireSRWLockExclusive(&g_sub.lock);
-    bool room = p.count < p.maxBlocks;
+    bool room = g_sub.dev == dev && p.count < p.maxBlocks;
     if (room)
     {
         p.blocks[p.count] = b;
@@ -763,7 +792,10 @@ static SubBlock* SubGrow(SubPool& p, const char* why)
         InterlockedAdd64(&p.freePages, b->pages);
     }
     ReleaseSRWLockExclusive(&g_sub.lock);
-    if (!room) { heap->Release(); delete[] b->bits; delete b; return NULL; }   // two growers raced past the cap
+    // two growers raced past the cap, or the pools retired meanwhile
+    if (!room) { heap->Release(); delete[] b->bits; delete b; }
+    dev->Release();
+    if (!room) return NULL;
     if (why)
         Log("SUB: %s block %ld added (%s, %.1f ms) | %.0f MB pooled, %.1f MB used", p.name, p.count, why, ms,
             PoolMB(p.totalPages), PoolMB(p.totalPages - p.freePages));
@@ -791,7 +823,9 @@ static void SubMark(SubBlock* b, UINT first, UINT n, bool used)
     }
 }
 
-static bool SubAllocFrom(SubPool& p, UINT n, SubSlot& out)
+// On success the slot's heap comes with a reference for the caller (heap),
+// so a retirement racing the placement can't free it underneath.
+static bool SubAllocFrom(SubPool& p, UINT n, SubSlot& out, ID3D12Heap*& heap)
 {
     bool ok = false;
     AcquireSRWLockExclusive(&g_sub.lock);
@@ -805,20 +839,22 @@ static bool SubAllocFrom(SubPool& p, UINT n, SubSlot& out)
         b->freePages -= n;
         InterlockedAdd64(&p.freePages, -(LONG64)n);
         out.block = b; out.first = (UINT)r; out.pages = n;
+        heap = b->heap;
+        heap->AddRef();
         ok = true;
     }
     ReleaseSRWLockExclusive(&g_sub.lock);
     return ok;
 }
 
-static bool SubAlloc(SubPool& p, UINT64 bytes, SubSlot& out)
+static bool SubAlloc(SubPool& p, UINT64 bytes, SubSlot& out, ID3D12Heap*& heap)
 {
     UINT n = (UINT)((bytes + SUB_PAGE - 1) / SUB_PAGE);
-    bool ok = SubAllocFrom(p, n, out);
+    bool ok = SubAllocFrom(p, n, out, heap);
     if (!ok)
     {
         if (p.count >= p.maxBlocks) { InterlockedIncrement(&g_sub.capped); return false; }
-        ok = SubGrow(p, "ran dry mid-burst") && SubAllocFrom(p, n, out);
+        ok = SubGrow(p, "ran dry mid-burst") && SubAllocFrom(p, n, out, heap);
     }
     if (p.freePages < (LONG64)(p.blockBytes / SUB_PAGE) && p.count < p.maxBlocks && g_sub.growEvent)
         SetEvent(g_sub.growEvent);   // keep a block's worth free ahead of the next burst
@@ -826,11 +862,126 @@ static bool SubAlloc(SubPool& p, UINT64 bytes, SubSlot& out)
 }
 static void SubFree(const SubSlot& s)
 {
+    SubBlock* b = s.block;
     AcquireSRWLockExclusive(&g_sub.lock);
-    SubMark(s.block, s.first, s.pages, false);
-    s.block->freePages += s.pages;
-    InterlockedAdd64(&s.block->pool->freePages, s.pages);
+    SubMark(b, s.first, s.pages, false);
+    b->freePages += s.pages;
+    bool done = b->retired && b->freePages == b->pages;   // a retired block's last resource is gone
+    if (!b->retired) InterlockedAdd64(&b->pool->freePages, s.pages);
     ReleaseSRWLockExclusive(&g_sub.lock);
+    if (done) { delete[] b->bits; delete b; }
+}
+
+// The pools let go of their device: every heap reference is dropped, and
+// blocks still holding pooled resources are kept, retired, until their last
+// one goes. Heaps are released outside the lock (the last one may take the
+// device with it).
+static void SubRetire(const char* why)
+{
+    ID3D12Heap* heaps[POOL_COUNT * SUB_MAX_BLOCKS];   // 6 KB on the stack
+    int count = 0, kept = 0;
+    AcquireSRWLockExclusive(&g_sub.lock);
+    if (!g_sub.dev) { ReleaseSRWLockExclusive(&g_sub.lock); return; }
+    for (SubPool& p : g_sub.pools)
+    {
+        for (LONG i = 0; i < p.count; ++i)
+        {
+            SubBlock* b = p.blocks[i];
+            heaps[count++] = b->heap;
+            b->heap = NULL;
+            if (b->freePages == b->pages) { delete[] b->bits; delete b; }
+            else { b->retired = true; ++kept; }
+            p.blocks[i] = NULL;
+        }
+        p.count = 0;
+        p.totalPages = p.freePages = 0;
+    }
+    g_sub.dev = NULL;
+    ReleaseSRWLockExclusive(&g_sub.lock);
+    for (int i = 0; i < count; ++i) heaps[i]->Release();
+    Log("SUB: pools retired (%s) - %d heaps let go, %d still in use by the game's resources until they go", why, count, kept);
+}
+
+// Moves the retired pools to d, if the game has live queues on it (a device
+// it's using, not one it made and dropped). Blocks are made as needed.
+static bool SubAdopt(ID3D12Device* d)
+{
+    AcquireSRWLockExclusive(&g_sub.lock);
+    bool ok = false;
+    if (!g_sub.dev)
+        for (const DeviceQueues& dq : g_sub.devices)
+            if (dq.dev == d && dq.live > 0) ok = true;
+    if (ok) g_sub.dev = d;
+    ReleaseSRWLockExclusive(&g_sub.lock);
+    if (ok) Log("SUB: pools moved to the game's new device %p - blocks are made as needed", d);
+    return ok;
+}
+
+// A queue watcher: held by one of the game's queues as private data, released
+// by D3D12 when it destroys the queue. When a device's last watched queue goes
+// and the pools are on it, they retire.
+// {3C8F2D14-6A9B-4E07-B5C1-8D2E4F6A9B30}
+static const GUID QUEUE_WATCH_GUID = { 0x3c8f2d14, 0x6a9b, 0x4e07, { 0xb5, 0xc1, 0x8d, 0x2e, 0x4f, 0x6a, 0x9b, 0x30 } };
+
+static void SubQueueGone(ID3D12Device* dev)
+{
+    AcquireSRWLockExclusive(&g_sub.lock);
+    bool retire = false;
+    for (DeviceQueues& dq : g_sub.devices)
+        if (dq.dev == dev && dq.live > 0 && --dq.live == 0)
+        {
+            retire = dev == g_sub.dev;
+            dq.dev = NULL;   // the entry is free again
+        }
+    ReleaseSRWLockExclusive(&g_sub.lock);
+    if (retire) SubRetire("the game destroyed its last queue on the device");
+}
+
+struct QueueWatch final : IUnknown
+{
+    volatile LONG ref = 1;
+    ID3D12Device* dev;   // not a reference: compared only
+    explicit QueueWatch(ID3D12Device* d) : dev(d) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** pp) override
+    {
+        if (riid == __uuidof(IUnknown)) { *pp = this; AddRef(); return S_OK; }
+        *pp = NULL; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        LONG r = InterlockedDecrement(&ref);
+        if (r == 0)
+        {
+            SubQueueGone(dev);
+            delete this;
+        }
+        return (ULONG)r;
+    }
+};
+
+static thread_local bool t_probeQueue = false;   // set while the mod makes its own probe queue: not the game's
+
+// A queue the game just made on dev: count it, and watch for its end.
+static void SubWatchQueue(ID3D12Device* dev, ID3D12CommandQueue* q)
+{
+    AcquireSRWLockExclusive(&g_sub.lock);
+    DeviceQueues* slot = NULL;
+    for (DeviceQueues& dq : g_sub.devices) if (dq.dev == dev) slot = &dq;
+    for (DeviceQueues& dq : g_sub.devices) if (!slot && !dq.dev) slot = &dq;
+    if (slot) { slot->dev = dev; ++slot->live; }
+    ReleaseSRWLockExclusive(&g_sub.lock);
+    if (!slot) { Log("SUB: more than %d devices with queues - this one isn't watched", SUB_MAX_DEVICES); return; }
+    QueueWatch* w = new QueueWatch(dev);
+    if (SUCCEEDED(q->SetPrivateDataInterface(QUEUE_WATCH_GUID, w))) w->Release();   // the queue holds it now
+    else
+    {
+        delete w;   // never armed; take back its count
+        AcquireSRWLockExclusive(&g_sub.lock);
+        if (slot->dev == dev && slot->live > 0 && --slot->live == 0) slot->dev = NULL;
+        ReleaseSRWLockExclusive(&g_sub.lock);
+        Log("SUB: could not watch a queue - the pools stay on its device until the game closes");
+    }
 }
 
 static DWORD WINAPI SubGrowThread(LPVOID)
@@ -885,6 +1036,7 @@ static SubPool* SubEligible(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3
     if (hp->CreationNodeMask > 1 || hp->VisibleNodeMask > 1) return NULL;
     if (hf != D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) return NULL;
     if (rd->SampleDesc.Count != 1 || rd->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) return NULL;
+    if (d != g_sub.dev && !SubAdopt(d)) return NULL;   // pools live on one device at a time
     SubPool* p = NULL;
     switch (hp->Type)
     {
@@ -944,8 +1096,10 @@ static bool SubTry(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_
     SubPool* pool = SubEligible(d, hp, hf, rd, cv, pp, bytes);
     if (!pool) return false;
     SubSlot slot;
-    if (!SubAlloc(*pool, bytes, slot)) { InterlockedIncrement(&g_sub.fellBack); return false; }
-    hr = place(slot.block->heap, (UINT64)slot.first * SUB_PAGE);
+    ID3D12Heap* heap = NULL;
+    if (!SubAlloc(*pool, bytes, slot, heap)) { InterlockedIncrement(&g_sub.fellBack); return false; }
+    hr = place(heap, (UINT64)slot.first * SUB_PAGE);
+    heap->Release();   // a placed resource holds its heap itself
     if (FAILED(hr) || !*pp)
     {
         SubFree(slot);
@@ -961,7 +1115,6 @@ static void SubPrewarm(ID3D12Device* dev)
     D3D12_FEATURE_DATA_D3D12_OPTIONS o = {};
     bool tier = SUCCEEDED(dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &o, sizeof(o))) &&
                 o.ResourceHeapTier >= D3D12_RESOURCE_HEAP_TIER_2;
-    g_sub.dev = dev;   // the game's device: alive for the whole session
     g_sub.tierOk = tier;
     if (!tier)
     {
@@ -969,10 +1122,23 @@ static void SubPrewarm(ID3D12Device* dev)
         return;
     }
     SubSetupPools();
+    // The caller holds dev for the prewarm; afterwards the blocks' heaps hold
+    // it. With no block made, the pools wait to adopt it once the game's queues
+    // are up (SubAdopt), rather than point at a device nothing of ours holds.
+    AcquireSRWLockExclusive(&g_sub.lock);
+    g_sub.dev = dev;
+    ReleaseSRWLockExclusive(&g_sub.lock);
     LONGLONG t0 = Now();
+    int blocks = 0;
     for (int i = 0; i < POOL_COUNT; ++i)
-        for (int k = 0; k < g_sub.pools[i].prewarm; ++k)
+        for (int k = 0; k < g_sub.pools[i].prewarm; ++k, ++blocks)
             if (!SubGrow(g_sub.pools[i], NULL)) break;
+    if (!blocks)
+    {
+        AcquireSRWLockExclusive(&g_sub.lock);
+        g_sub.dev = NULL;
+        ReleaseSRWLockExclusive(&g_sub.lock);
+    }
     double ms = Ms(Now() - t0);
     g_sub.growEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
     HANDLE t = CreateThread(NULL, 0, SubGrowThread, NULL, 0, NULL);
@@ -1515,8 +1681,11 @@ static DWORD WINAPI PresentHookThread(LPVOID param)
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     PFN_CreateDXGIFactory2 pCreate = (PFN_CreateDXGIFactory2)GetProcAddress(LoadLibraryA("dxgi.dll"), "CreateDXGIFactory2");
+    t_probeQueue = true;   // goes through the queue hook, but isn't one of the game's
+    HRESULT madeQueue = hwnd ? dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q)) : E_FAIL;
+    t_probeQueue = false;
     if (!hwnd) fail = "probe window";
-    else if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q)))) fail = "probe command queue";
+    else if (FAILED(madeQueue)) fail = "probe command queue";
     else if (!pCreate || FAILED(pCreate(0, IID_PPV_ARGS(&fac)))) fail = "DXGI factory";
     else
     {
@@ -1944,9 +2113,16 @@ static void HookQueueMethods(void* queue)
     Log("QUEUE: hooked %s on the queues' code", ok);
 }
 
-static void NoteQueue(const D3D12_COMMAND_QUEUE_DESC* d, void* q)
+static void NoteQueue(ID3D12Device* dev, const D3D12_COMMAND_QUEUE_DESC* d, void* q)
 {
     if (!q || !d) return;
+    // the pools follow the game's queues (SubWatchQueue); the mod's probe isn't one
+    ID3D12CommandQueue* queue = NULL;
+    if (!t_probeQueue && SUCCEEDED(((IUnknown*)q)->QueryInterface(IID_PPV_ARGS(&queue))))
+    {
+        SubWatchQueue(dev, queue);
+        queue->Release();
+    }
     LONG i = InterlockedIncrement(&g_nQueues) - 1;
     if (i >= MAX_QUEUES) { Log("QUEUE: more than %d queues; the rest are not counted", MAX_QUEUES); return; }
     g_queues[i].type = d->Type; g_queues[i].prio = d->Priority;
@@ -1978,7 +2154,7 @@ static HRESULT STDMETHODCALLTYPE h_CreateCommandQueue(ID3D12Device* dev, const D
     D3D12_COMMAND_QUEUE_DESC copy;
     d = QueueDesc(d, copy);
     HRESULT hr = o_CreateCommandQueue(dev, d, riid, pp);
-    if (SUCCEEDED(hr) && pp) NoteQueue(d, *pp);
+    if (SUCCEEDED(hr) && pp) NoteQueue(dev, d, *pp);
     return hr;
 }
 
@@ -1987,7 +2163,7 @@ static HRESULT STDMETHODCALLTYPE h_CreateCommandQueue1(ID3D12Device* dev, const 
     D3D12_COMMAND_QUEUE_DESC copy;
     d = QueueDesc(d, copy);
     HRESULT hr = o_CreateCommandQueue1(dev, d, creator, riid, pp);
-    if (SUCCEEDED(hr) && pp) NoteQueue(d, *pp);
+    if (SUCCEEDED(hr) && pp) NoteQueue(dev, d, *pp);
     return hr;
 }
 
