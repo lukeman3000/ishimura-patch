@@ -1306,6 +1306,39 @@ static LONG APIENTRY h_KmtWait(const void* args)
 }
 
 // ----------------------------------------------------------------------------
+// Code hooks (MinHook) are installed under a lock shared by name with other
+// tools that take it too (FrameScope does), one per process: two hookers
+// working on the same function at the same moment can cut each other out.
+// An owner that died mid-install hands it over abandoned, which still
+// counts; the wait is bounded so a stuck holder can't stop the game.
+// ----------------------------------------------------------------------------
+struct HookLock
+{
+    HANDLE mutex = NULL;
+    HookLock()
+    {
+        char name[64];
+        _snprintf_s(name, sizeof(name), _TRUNCATE, "Local\\D3D12HookInstall-%lu", GetCurrentProcessId());
+        mutex = CreateMutexA(NULL, FALSE, name);
+        DWORD r = mutex ? WaitForSingleObject(mutex, 5000) : WAIT_FAILED;
+        if (r != WAIT_OBJECT_0 && r != WAIT_ABANDONED)
+        {
+            Log("hooks: install lock %s - installing anyway", r == WAIT_TIMEOUT ? "busy for 5 s" : "unavailable");
+            if (mutex) CloseHandle(mutex);
+            mutex = NULL;
+        }
+    }
+    ~HookLock()
+    {
+        if (!mutex) return;
+        ReleaseMutex(mutex);
+        CloseHandle(mutex);
+    }
+    HookLock(const HookLock&) = delete;
+    HookLock& operator=(const HookLock&) = delete;
+};
+
+// ----------------------------------------------------------------------------
 // Vtable patching: the original is stored before the entry is swapped, so a
 // call racing the patch reaches either the original or a ready detour.
 // ----------------------------------------------------------------------------
@@ -1702,6 +1735,7 @@ static DWORD WINAPI PresentHookThread(LPVOID param)
             { VT_Present,  (void*)h_Present,  (void**)&o_Present,  "Present" },
             { VT_Present1, (void*)h_Present1, (void**)&o_Present1, "Present1" },
         };
+        HookLock lock;
         for (auto& f : fns)
         {
             void* target = vt[f.idx];
@@ -2102,6 +2136,7 @@ static void HookQueueMethods(void* queue)
         { VT_Q_Wait,                (void*)h_Wait,                (void**)&o_Wait,                "Wait" },
     };
     char ok[160] = {};
+    HookLock lock;
     for (auto& x : m)
     {
         MH_STATUS s = MH_CreateHook(vt[x.idx], x.det, x.orig);
@@ -2737,8 +2772,12 @@ static bool HookExport(const char* dll, const char* fn, void* detour, void** ori
     HMODULE m = LoadLibraryA(dll);
     void* target = m ? (void*)GetProcAddress(m, fn) : NULL;
     if (!target) { Log("%s NOT FOUND (%s!%s)", label, dll, fn); return false; }
-    MH_STATUS s = MH_CreateHook(target, detour, orig);
-    if (s == MH_OK) s = MH_EnableHook(target);
+    MH_STATUS s;
+    {
+        HookLock lock;
+        s = MH_CreateHook(target, detour, orig);
+        if (s == MH_OK) s = MH_EnableHook(target);
+    }
     char mod[MAX_PATH]; UINT_PTR base;
     ModuleOf(target, mod, sizeof(mod), &base);
     Log("%s %s (%s+0x%llX)", label, s == MH_OK ? "hooked" : MH_StatusToString(s),
