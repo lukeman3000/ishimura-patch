@@ -70,7 +70,7 @@
 // The version only changes when a version is released. Which build this is
 // - the commit it was built from, uncommitted changes, when - comes from
 // build.bat (build_id.h) and the compiler, so every log names its exact build.
-static const char* MOD_VERSION = "0.3.5";
+static const char* MOD_VERSION = "0.3.6";
 #if __has_include("build_id.h")
 #include "build_id.h"
 #else
@@ -284,7 +284,7 @@ static const char* DEFAULT_INI =
 "\n"
 "; Press this key right after a stutter or anything odd, and the mod marks\n"
 "; the moment in the log (a numbered MARK line with the time) and plays a\n"
-"; rising chime (Logging 2 and 3). At Logging = 3 it also saves the last\n"
+"; short beep (Logging 2 and 3). At Logging = 3 it also saves the last\n"
 "; minute of the log to its own file, ishimurapatch_capture_<date>_<time>.log,\n"
 "; which a relaunch does not overwrite. F1-F12 or a letter; empty = off.\n"
 "CaptureKey = F8\n"
@@ -2812,15 +2812,19 @@ static BYTE* MakeChime(const ChimeNote* notes, int count)
     return wav;
 }
 
-// Called from the key thread only; plays without waiting.
-static void PlayChime(bool on)
+// Called from the key thread only; plays without waiting. The mark key has its
+// own sound, FrameScope's mark tick: one short note, so it can't be taken for
+// on or off.
+enum Chime { CHIME_ON, CHIME_OFF, CHIME_MARK };
+static void PlayChime(Chime which)
 {
     static const ChimeNote RISING[] = { { 392, 110 }, { 587, 160 } };
     static const ChimeNote FALLING[] = { { 587, 110 }, { 392, 160 } };
-    static BYTE* rising = NULL;
-    static BYTE* falling = NULL;
-    BYTE*& wav = on ? rising : falling;
-    if (!wav) wav = MakeChime(on ? RISING : FALLING, 2);
+    static const ChimeNote MARK[] = { { 587, 90 } };
+    static const struct { const ChimeNote* notes; int count; } SOUNDS[] = { { RISING, 2 }, { FALLING, 2 }, { MARK, 1 } };
+    static BYTE* wavs[3] = {};
+    BYTE*& wav = wavs[which];
+    if (!wav) wav = MakeChime(SOUNDS[which].notes, SOUNDS[which].count);
     if (wav) PlaySoundA((LPCSTR)wav, NULL, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
 }
 
@@ -2848,7 +2852,7 @@ static DWORD WINAPI KeyThread(LPVOID)
                 // updated first, so the reload this save triggers is a no-op.
                 g_cfg.suballocate = now;
                 bool saved = IniSetValue(INI_FIX, KEY_SUBALLOCATE, now ? "1" : "0");
-                PlayChime(now != 0);
+                PlayChime(now ? CHIME_ON : CHIME_OFF);
                 char sum[256];
                 SubSummary(sum, sizeof(sum));
                 Log2("FIX: suballocation switched %s by the player%s | %s | %ld live, %ld made, %ld fell back",
@@ -2868,7 +2872,7 @@ static DWORD WINAPI KeyThread(LPVOID)
             GetLocalTime(&st);
             Log2("MARK %d by the player at %02d:%02d:%02d (%.0f ms)", ++marks, st.wHour, st.wMinute, st.wSecond,
                 Ms(Now() - g_qpc0));
-            PlayChime(true);
+            PlayChime(CHIME_MARK);
             if (g_cfg.logging >= 3 && g_ring && InterlockedCompareExchange(&g_captureBusy, 1, 0) == 0)
             {
                 Sleep(250);   // let the writer drain the frames up to the key press
