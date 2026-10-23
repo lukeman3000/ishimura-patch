@@ -835,6 +835,67 @@ static PFN_RES  o_MakeResident, o_Evict;
 static PFN_ENQ  o_Enqueue;
 
 // ----------------------------------------------------------------------------
+// Graphics memory: the game's adapter (by the device's LUID) reports how much
+// memory the game uses on the card and in system RAM, against the budget
+// Windows gives it. Past the card's budget Windows moves allocations out to
+// system RAM, where the GPU reaches them more slowly. The pools grow only with
+// room under the budget and hand empty blocks back near it (SubGrow,
+// SubGiveBack). The adapter is opened on the pools' grow thread, never inside
+// one of the game's calls, and holds no reference to the device.
+// ----------------------------------------------------------------------------
+typedef HRESULT (WINAPI* PFN_CreateDXGIFactory2)(UINT, REFIID, void**);
+static LUID g_adapterLuid;
+static volatile LONG g_adapterKnown = 0;   // 1 once PatchDevice has the LUID
+static IDXGIAdapter3* volatile g_adapter = NULL;
+
+// On the grow thread only.
+static void OpenAdapter()
+{
+    static bool tried = false;
+    if (g_adapter || tried || !g_adapterKnown) return;
+    tried = true;
+    PFN_CreateDXGIFactory2 pCreate = (PFN_CreateDXGIFactory2)GetProcAddress(LoadLibraryA("dxgi.dll"), "CreateDXGIFactory2");
+    IDXGIFactory4* fac = NULL;
+    IDXGIAdapter3* a = NULL;
+    if (pCreate && SUCCEEDED(pCreate(0, IID_PPV_ARGS(&fac))))
+    {
+        if (SUCCEEDED(fac->EnumAdapterByLuid(g_adapterLuid, IID_PPV_ARGS(&a))))
+        {
+            DXGI_ADAPTER_DESC2 d = {};
+            a->GetDesc2(&d);
+            Log("graphics memory: %ls, %llu MB on the card", d.Description, (unsigned long long)(d.DedicatedVideoMemory >> 20));
+            g_adapter = a;
+        }
+        fac->Release();
+    }
+    if (!g_adapter) Log("graphics memory: the game's adapter could not be opened - no VRAM numbers, pools grow to their caps");
+}
+
+// The card's memory (local) or system RAM's share (non-local); false until the
+// adapter is open. A /DSUB_BUDGET_TEST_MB build pretends the card's budget is
+// that size, to see the budget rules work in the test app.
+static bool MemoryInfo(bool local, DXGI_QUERY_VIDEO_MEMORY_INFO& m)
+{
+    IDXGIAdapter3* a = g_adapter;
+    if (!a || FAILED(a->QueryVideoMemoryInfo(0, local ? DXGI_MEMORY_SEGMENT_GROUP_LOCAL : DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &m)))
+        return false;
+#ifdef SUB_BUDGET_TEST_MB
+    if (local) m.Budget = (UINT64)SUB_BUDGET_TEST_MB << 20;
+#endif
+    return true;
+}
+
+static void VramText(char* out, size_t n)
+{
+    DXGI_QUERY_VIDEO_MEMORY_INFO card = {}, sys = {};
+    if (!MemoryInfo(true, card)) { _snprintf_s(out, n, _TRUNCATE, "VRAM n/a"); return; }
+    MemoryInfo(false, sys);
+    _snprintf_s(out, n, _TRUNCATE, "VRAM %.0f of %.0f MB budget%s, %.0f MB in system RAM",
+                card.CurrentUsage / 1048576.0, card.Budget / 1048576.0, card.CurrentUsage > card.Budget ? " (OVER)" : "",
+                sys.CurrentUsage / 1048576.0);
+}
+
+// ----------------------------------------------------------------------------
 // Suballocation: 64 KB pages in large heaps, one bitmap per heap, first fit.
 // Three pools, one per heap type the game makes small committed resources
 // in: DEFAULT (GPU-only: textures and buffers), UPLOAD and READBACK (CPU-
@@ -894,6 +955,8 @@ struct SubState
     HANDLE         growEvent = NULL;
     DeviceQueues   devices[SUB_MAX_DEVICES] = {};
     volatile LONG  live = 0, made = 0, fellBack = 0, heapFails = 0, capped = 0;
+    volatile LONG  budgetHeld = 0, givenBack = 0;   // growth held at the memory budget; empty blocks handed back
+    bool           heldLogged = false;                // "not growing" said once per stretch near the budget
 };
 static SubState g_sub;
 
@@ -940,10 +1003,34 @@ static void SubSummary(char* out, size_t n)
     }
 }
 
+// The budget rules. A pool grows only if the new block leaves at least 10% of
+// the budget free; empty blocks go back above 95% (SubGiveBack). The gap
+// keeps a block from being handed back and made again in a loop. The card's
+// budget for DEFAULT; system RAM's for UPLOAD and READBACK.
+static const double SUB_GROW_BELOW = 0.90, SUB_GIVE_ABOVE = 0.95;
+static bool SubBudgetRoom(const SubPool& p)
+{
+    DXGI_QUERY_VIDEO_MEMORY_INFO m = {};
+    if (!MemoryInfo(p.type == D3D12_HEAP_TYPE_DEFAULT, m) || !m.Budget) return true;   // no numbers: the caps alone
+    return m.CurrentUsage + p.blockBytes <= (UINT64)(m.Budget * SUB_GROW_BELOW);
+}
+
 // Makes one heap outside the lock, then adds it under the lock - if the pools
 // are still on the device it was made on (they may have retired meanwhile).
 static SubBlock* SubGrow(SubPool& p, const char* why)
 {
+    if (!SubBudgetRoom(p))
+    {
+        InterlockedIncrement(&g_sub.budgetHeld);
+        if (!g_sub.heldLogged)
+        {
+            g_sub.heldLogged = true;
+            char vram[160];
+            VramText(vram, sizeof(vram));
+            Log2("SUB: %s pool not growing - near the memory budget (%s); new resources are made the normal way", p.name, vram);
+        }
+        return NULL;
+    }
     AcquireSRWLockExclusive(&g_sub.lock);
     ID3D12Device* dev = g_sub.dev;
     if (dev) dev->AddRef();   // alive while set (see SubState); held across the unlocked heap creation
@@ -1175,15 +1262,54 @@ static void SubWatchQueue(ID3D12Device* dev, ID3D12CommandQueue* q)
     }
 }
 
+// Hands back a pool's empty blocks: near the budget (SUB_GIVE_ABOVE), or any
+// time the fix is off, when the game's new memory is being made the normal
+// way on top of the pools. Heaps are released outside the lock.
+static void SubGiveBack(SubPool& p)
+{
+    bool off = !g_sub.on, tight = false;
+    DXGI_QUERY_VIDEO_MEMORY_INFO m = {};
+    if (MemoryInfo(p.type == D3D12_HEAP_TYPE_DEFAULT, m) && m.Budget)
+        tight = m.CurrentUsage > (UINT64)(m.Budget * SUB_GIVE_ABOVE);
+    if (!off && !tight) return;
+    ID3D12Heap* heaps[SUB_MAX_BLOCKS];
+    int n = 0;
+    AcquireSRWLockExclusive(&g_sub.lock);
+    for (LONG i = 0; i < p.count; )
+    {
+        SubBlock* b = p.blocks[i];
+        if (b->freePages != b->pages) { ++i; continue; }
+        heaps[n++] = b->heap;
+        InterlockedAdd64(&p.totalPages, -(LONG64)b->pages);
+        InterlockedAdd64(&p.freePages, -(LONG64)b->pages);
+        delete[] b->bits; delete b;
+        for (LONG k = i; k + 1 < p.count; ++k) p.blocks[k] = p.blocks[k + 1];
+        p.blocks[p.count - 1] = NULL;
+        InterlockedDecrement(&p.count);
+        if (tight && !off) break;   // near the budget: one at a time, a second apart
+    }
+    ReleaseSRWLockExclusive(&g_sub.lock);
+    if (!n) return;
+    for (int i = 0; i < n; ++i) heaps[i]->Release();
+    InterlockedAdd(&g_sub.givenBack, n);
+    char vram[160];
+    VramText(vram, sizeof(vram));
+    Log2("SUB: %s gave back %d empty block%s (%llu MB, %s) | %s", p.name, n, n == 1 ? "" : "s",
+        (unsigned long long)(n * (p.blockBytes >> 20)), off ? "the fix is off" : "near the memory budget", vram);
+}
+
 static DWORD WINAPI SubGrowThread(LPVOID)
 {
     for (;;)
     {
         WaitForSingleObject(g_sub.growEvent, 1000);
+        OpenAdapter();
+        if (SubBudgetRoom(g_sub.pools[POOL_DEFAULT])) g_sub.heldLogged = false;   // room again: say so next time
+        for (int i = 0; i < POOL_COUNT; ++i) SubGiveBack(g_sub.pools[i]);
         for (int i = 0; i < POOL_COUNT; ++i)
         {
             SubPool& p = g_sub.pools[i];
-            while (g_sub.on && p.count > 0 && p.count < p.maxBlocks &&
+            while (g_sub.on && g_sub.dev && p.count < p.maxBlocks &&   // dev: not while retired
                    p.freePages < (LONG64)(p.blockBytes / SUB_PAGE))
                 if (!SubGrow(p, "ahead of need")) break;
         }
@@ -1571,52 +1697,6 @@ static void FileVersion(const char* path, char* out, size_t outSize)
 }
 
 // ----------------------------------------------------------------------------
-// Graphics memory: the game's adapter (by the device's LUID) reports how much
-// memory the game uses on the card and in system RAM, against the budget
-// Windows gives it. Past the card's budget Windows moves allocations out to
-// system RAM, where the GPU reaches them more slowly. Read at each STATS line
-// and F9 press; the adapter is opened at the first read, not inside the
-// game's device creation, and holds no reference to the device.
-// ----------------------------------------------------------------------------
-typedef HRESULT (WINAPI* PFN_CreateDXGIFactory2)(UINT, REFIID, void**);
-static LUID g_adapterLuid;
-static volatile LONG g_adapterKnown = 0;   // 1 once PatchDevice has the LUID
-static IDXGIAdapter3* g_adapter = NULL;
-
-static void VramText(char* out, size_t n)
-{
-    static volatile LONG tried = 0;   // the frame thread and the key thread both read
-    if (!g_adapter && g_adapterKnown && InterlockedCompareExchange(&tried, 1, 0) == 0)
-    {
-        PFN_CreateDXGIFactory2 pCreate = (PFN_CreateDXGIFactory2)GetProcAddress(LoadLibraryA("dxgi.dll"), "CreateDXGIFactory2");
-        IDXGIFactory4* fac = NULL;
-        IDXGIAdapter3* a = NULL;
-        if (pCreate && SUCCEEDED(pCreate(0, IID_PPV_ARGS(&fac))))
-        {
-            if (SUCCEEDED(fac->EnumAdapterByLuid(g_adapterLuid, IID_PPV_ARGS(&a))))
-            {
-                DXGI_ADAPTER_DESC2 d = {};
-                a->GetDesc2(&d);
-                Log("graphics memory: %ls, %llu MB on the card", d.Description, (unsigned long long)(d.DedicatedVideoMemory >> 20));
-                g_adapter = a;
-            }
-            fac->Release();
-        }
-        if (!g_adapter) Log("graphics memory: the game's adapter could not be opened - no VRAM numbers this session");
-    }
-    DXGI_QUERY_VIDEO_MEMORY_INFO card = {}, sys = {};
-    if (!g_adapter || FAILED(g_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &card)))
-    {
-        _snprintf_s(out, n, _TRUNCATE, "VRAM n/a");
-        return;
-    }
-    g_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &sys);
-    _snprintf_s(out, n, _TRUNCATE, "VRAM %.0f of %.0f MB budget%s, %.0f MB in system RAM",
-                card.CurrentUsage / 1048576.0, card.Budget / 1048576.0, card.CurrentUsage > card.Budget ? " (OVER)" : "",
-                sys.CurrentUsage / 1048576.0);
-}
-
-// ----------------------------------------------------------------------------
 // Frames: Present / Present1 on the swap chain's vtable
 // ----------------------------------------------------------------------------
 typedef HRESULT (STDMETHODCALLTYPE* PFN_PRESENT)(IDXGISwapChain*, UINT, UINT);
@@ -1713,8 +1793,10 @@ static void OnFrame()
         {
             char sum[256];
             SubSummary(sum, sizeof(sum));
-            Log2("SUB fix %s | %s | %ld live, %ld made, %ld fell back (%ld at a pool cap), %ld block failures",
-                g_sub.on ? "on" : "off", sum, g_sub.live, g_sub.made, g_sub.fellBack, g_sub.capped, g_sub.heapFails);
+            Log2("SUB fix %s | %s | %ld live, %ld made, %ld fell back (%ld at a pool cap), %ld block failures"
+                " | growth held at the memory budget %ld times, %ld empty blocks given back",
+                g_sub.on ? "on" : "off", sum, g_sub.live, g_sub.made, g_sub.fellBack, g_sub.capped, g_sub.heapFails,
+                g_sub.budgetHeld, g_sub.givenBack);
         }
         LONGLONG keepLast = g_stats.last;
         g_stats = Stats();
