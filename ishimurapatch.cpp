@@ -242,11 +242,11 @@ static const char* DEFAULT_INI =
 "; A frame at least this long (ms) gets a HITCH line.\n"
 "HitchMs = 20\n"
 "\n"
-"; Press this key right after a stutter and the mod marks the moment in the\n"
-"; log and saves the last minute of it to its own file,\n"
-"; ishimurapatch_capture_<date>_<time>.log, which a relaunch does not\n"
-"; overwrite. Works at Logging = 2 only; inert at the others. F1-F12 or a\n"
-"; letter; empty = off.\n"
+"; Press this key right after a stutter or anything odd, and the mod marks\n"
+"; the moment in the log (a numbered MARK line with the time) and plays a\n"
+"; rising chime. At Logging = 2 it also saves the last minute of the log to\n"
+"; its own file, ishimurapatch_capture_<date>_<time>.log, which a relaunch\n"
+"; does not overwrite. F1-F12 or a letter; empty = off.\n"
 "CaptureKey = F8\n"
 "\n"
 "\n"
@@ -2582,7 +2582,8 @@ static void PlayChime(bool on)
     if (wav) PlaySoundA((LPCSTR)wav, NULL, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
 }
 
-// The capture key (Logging 2) and the fix's toggle key (any level). Both are
+// The mark key (any logging; also saves a capture at Logging 2) and the fix's
+// toggle key (any level). Both are
 // looked up again each poll, so a live reload changes them.
 static DWORD WINAPI KeyThread(LPVOID)
 {
@@ -2590,7 +2591,7 @@ static DWORD WINAPI KeyThread(LPVOID)
     for (;;)
     {
         Sleep(30);
-        WORD vk = (g_cfg.logging == 2 && g_ring) ? KeyVk(g_cfg.captureKey) : 0;
+        WORD vk = g_cfg.logging ? KeyVk(g_cfg.captureKey) : 0;
         WORD tk = KeyVk(g_cfg.toggleKey);
         bool tDown = tk && (GetAsyncKeyState(tk) & 0x8000) != 0;
         if (tDown && !tWas && GameHasFocus())
@@ -2616,16 +2617,27 @@ static DWORD WINAPI KeyThread(LPVOID)
         }
         tWas = tDown;
         bool down = vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
-        if (down && !was && GameHasFocus() && InterlockedCompareExchange(&g_captureBusy, 1, 0) == 0)
+        if (down && !was && GameHasFocus())
         {
-            Sleep(250);   // let the writer drain the frames up to the key press
-            double stampNow = Ms(Now() - g_qpc0);
-            Log("CAPTURE: marked by the player (the last %.0f s saved)", CAPTURE_WINDOW_MS / 1000.0);
-            void* param = NULL;
-            memcpy(&param, &stampNow, sizeof(stampNow));
-            HANDLE t = CreateThread(NULL, 0, CaptureLog, param, 0, NULL);
-            if (t) CloseHandle(t);
-            else InterlockedExchange(&g_captureBusy, 0);
+            // A numbered mark with the time on the PC clock, so a tester's
+            // note ("mark 3: enemy in the floor") finds its place in the log.
+            static int marks = 0;
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            Log("MARK %d by the player at %02d:%02d:%02d (%.0f ms)", ++marks, st.wHour, st.wMinute, st.wSecond,
+                Ms(Now() - g_qpc0));
+            PlayChime(true);
+            if (g_cfg.logging == 2 && g_ring && InterlockedCompareExchange(&g_captureBusy, 1, 0) == 0)
+            {
+                Sleep(250);   // let the writer drain the frames up to the key press
+                double stampNow = Ms(Now() - g_qpc0);
+                Log("CAPTURE: marked by the player (the last %.0f s saved)", CAPTURE_WINDOW_MS / 1000.0);
+                void* param = NULL;
+                memcpy(&param, &stampNow, sizeof(stampNow));
+                HANDLE t = CreateThread(NULL, 0, CaptureLog, param, 0, NULL);
+                if (t) CloseHandle(t);
+                else InterlockedExchange(&g_captureBusy, 0);
+            }
         }
         was = down;
     }
