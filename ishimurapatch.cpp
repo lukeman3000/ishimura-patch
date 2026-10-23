@@ -1571,6 +1571,52 @@ static void FileVersion(const char* path, char* out, size_t outSize)
 }
 
 // ----------------------------------------------------------------------------
+// Graphics memory: the game's adapter (by the device's LUID) reports how much
+// memory the game uses on the card and in system RAM, against the budget
+// Windows gives it. Past the card's budget Windows moves allocations out to
+// system RAM, where the GPU reaches them more slowly. Read at each STATS line
+// and F9 press; the adapter is opened at the first read, not inside the
+// game's device creation, and holds no reference to the device.
+// ----------------------------------------------------------------------------
+typedef HRESULT (WINAPI* PFN_CreateDXGIFactory2)(UINT, REFIID, void**);
+static LUID g_adapterLuid;
+static volatile LONG g_adapterKnown = 0;   // 1 once PatchDevice has the LUID
+static IDXGIAdapter3* g_adapter = NULL;
+
+static void VramText(char* out, size_t n)
+{
+    static volatile LONG tried = 0;   // the frame thread and the key thread both read
+    if (!g_adapter && g_adapterKnown && InterlockedCompareExchange(&tried, 1, 0) == 0)
+    {
+        PFN_CreateDXGIFactory2 pCreate = (PFN_CreateDXGIFactory2)GetProcAddress(LoadLibraryA("dxgi.dll"), "CreateDXGIFactory2");
+        IDXGIFactory4* fac = NULL;
+        IDXGIAdapter3* a = NULL;
+        if (pCreate && SUCCEEDED(pCreate(0, IID_PPV_ARGS(&fac))))
+        {
+            if (SUCCEEDED(fac->EnumAdapterByLuid(g_adapterLuid, IID_PPV_ARGS(&a))))
+            {
+                DXGI_ADAPTER_DESC2 d = {};
+                a->GetDesc2(&d);
+                Log("graphics memory: %ls, %llu MB on the card", d.Description, (unsigned long long)(d.DedicatedVideoMemory >> 20));
+                g_adapter = a;
+            }
+            fac->Release();
+        }
+        if (!g_adapter) Log("graphics memory: the game's adapter could not be opened - no VRAM numbers this session");
+    }
+    DXGI_QUERY_VIDEO_MEMORY_INFO card = {}, sys = {};
+    if (!g_adapter || FAILED(g_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &card)))
+    {
+        _snprintf_s(out, n, _TRUNCATE, "VRAM n/a");
+        return;
+    }
+    g_adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &sys);
+    _snprintf_s(out, n, _TRUNCATE, "VRAM %.0f of %.0f MB budget%s, %.0f MB in system RAM",
+                card.CurrentUsage / 1048576.0, card.Budget / 1048576.0, card.CurrentUsage > card.Budget ? " (OVER)" : "",
+                sys.CurrentUsage / 1048576.0);
+}
+
+// ----------------------------------------------------------------------------
 // Frames: Present / Present1 on the swap chain's vtable
 // ----------------------------------------------------------------------------
 typedef HRESULT (STDMETHODCALLTYPE* PFN_PRESENT)(IDXGISwapChain*, UINT, UINT);
@@ -1656,11 +1702,13 @@ static void OnFrame()
 
     if (Ms(now - g_stats.windowStart) >= 30000.0)
     {
+        char vram[160];
+        VramText(vram, sizeof(vram));
         Log2("STATS %.0f s: %ld frames, avg %.2f ms, worst %.1f ms, hitches %ld | creates %ld (%.1f/frame) %.1f MB"
-            " | thread-ms in creates %.1f (residency wait %.1f)",
+            " | thread-ms in creates %.1f (residency wait %.1f) | %s",
             Ms(now - g_stats.windowStart) / 1000.0, g_stats.frames, g_stats.frameMs / (g_stats.frames ? g_stats.frames : 1),
             g_stats.worstMs, g_stats.hitches, g_stats.creates,
-            g_stats.creates / (double)(g_stats.frames ? g_stats.frames : 1), g_stats.mb, g_stats.createMs, g_stats.waitMs);
+            g_stats.creates / (double)(g_stats.frames ? g_stats.frames : 1), g_stats.mb, g_stats.createMs, g_stats.waitMs, vram);
         if (g_sub.tierOk)
         {
             char sum[256];
@@ -1753,7 +1801,6 @@ static HRESULT STDMETHODCALLTYPE h_Present1(IDXGISwapChain1* sc, UINT sync, UINT
 // pointing at the other - the 0.1.0 first build overflowed the stack on the
 // game's first Present that way (10/18, Steam overlay loaded). Hooks on the
 // code chain one after another whatever order they go in.
-typedef HRESULT (WINAPI* PFN_CreateDXGIFactory2)(UINT, REFIID, void**);
 // ----------------------------------------------------------------------------
 // The data read cap ([Advanced] DataReadMBs). At a streaming boundary the engine
 // decompresses the new area's bundles as jobs on the same 14 worker threads
@@ -2441,6 +2488,8 @@ static void PatchDevice(ID3D12Device* dev, const char* how)
     FileVersion(mod, ver, sizeof(ver));
     Log("setup: device found via %s | vtable %s+0x%llX (version %s) | interfaces up to ID3D12Device%d",
         how, mod, (unsigned long long)((UINT_PTR)vt - base), ver, level ? level : 1);
+    g_adapterLuid = dev->GetAdapterLuid();
+    InterlockedExchange(&g_adapterKnown, 1);
 
     struct { int idx; void* det; void** orig; int need; const char* name; } slots[] = {
         { VT_CreateCommandQueue,       (void*)h_CreateCommandQueue,  (void**)&o_CreateCommandQueue,  0, "CreateCommandQueue" },
@@ -2855,9 +2904,11 @@ static DWORD WINAPI KeyThread(LPVOID)
                 PlayChime(now ? CHIME_ON : CHIME_OFF);
                 char sum[256];
                 SubSummary(sum, sizeof(sum));
-                Log2("FIX: suballocation switched %s by the player%s | %s | %ld live, %ld made, %ld fell back",
+                char vram[160];
+                VramText(vram, sizeof(vram));
+                Log2("FIX: suballocation switched %s by the player%s | %s | %ld live, %ld made, %ld fell back | %s",
                     now ? "ON" : "OFF", saved ? " (saved to the ini)" : " (ini not updated: no " KEY_SUBALLOCATE " line in [" INI_FIX "])",
-                    sum, g_sub.live, g_sub.made, g_sub.fellBack);
+                    sum, g_sub.live, g_sub.made, g_sub.fellBack, vram);
                 if (now && g_sub.growEvent) SetEvent(g_sub.growEvent);
             }
         }
