@@ -229,8 +229,9 @@ static const char* DEFAULT_INI =
 "\n"
 "[Advanced]\n"
 "\n"
-"; Write a log to ishimurapatch.log (a fresh file every launch; a session's\n"
-"; log stops at 256 MB)\n"
+"; Write a log to ishimurapatch.log (a fresh file every launch). At 128 MB\n"
+"; it becomes ishimurapatch.previous.log and a new one starts, so a long\n"
+"; session keeps the latest 128-256 MB.\n"
 ";  0 = off\n"
 ";  1 = on (default): what was hooked, one HITCH line for every frame at\n"
 ";      least HitchMs long, and a STATS line every 30 seconds\n"
@@ -388,40 +389,122 @@ static void EnsureCs(LazyCs& l)
     else while (l.state != 2) Sleep(0);
 }
 
+// The log rolls: at LOG_SEGMENT_BYTES, ishimurapatch.log becomes
+// ishimurapatch.previous.log (replacing the one before) and a new one starts,
+// so a long Logging 2 session keeps going (and F8 keeps working) in at most
+// two segments on disk. Each new segment opens with the session's start
+// (everything up to "init done") and every setup line so far, so a segment,
+// or a capture cut from one, always says which build and settings ran.
 struct LogState
 {
     LazyCs cs;
     FILE*  file = NULL;
     long   bytes = 0;
-    bool   capped = false;
+    long   rollRetryAt = 0;
+    int    segment = 1;
+    char*  head = NULL;
+    size_t headLen = 0, headCap = 0;
+    bool   headDone = false;
 };
 static LogState g_log;
-static const long LOG_CAP_BYTES = 256L * 1024 * 1024;
+#ifndef LOG_SEGMENT_MB
+#define LOG_SEGMENT_MB 128   // a test build sets a small one (/DLOG_SEGMENT_MB=1) to roll quickly
+#endif
+static const long LOG_SEGMENT_BYTES = LOG_SEGMENT_MB * 1024L * 1024;
+static const size_t LOG_HEAD_MAX = 256 * 1024;
+static const char* const LOG_ROLL_MARK = "--- log rolled";
+
+static void PreviousLogPath(char* out, size_t size)
+{
+    strncpy_s(out, size, g_files.logPath, _TRUNCATE);
+    char* dot = strrchr(out, '.');
+    if (dot) _snprintf_s(dot, out + size - dot, _TRUNCATE, ".previous.log");
+}
+
+static void LogKeepHead(const char* text, size_t n)
+{
+    if (g_log.headLen + n > LOG_HEAD_MAX) return;
+    if (g_log.headLen + n > g_log.headCap)
+    {
+        size_t cap = g_log.headCap ? g_log.headCap : 16384;
+        while (cap < g_log.headLen + n) cap *= 2;
+        char* p = (char*)realloc(g_log.head, cap);
+        if (!p) return;
+        g_log.head = p;
+        g_log.headCap = cap;
+    }
+    memcpy(g_log.head + g_log.headLen, text, n);
+    g_log.headLen += n;
+}
+
+// Under the log lock.
+static void LogRoll()
+{
+    char prev[MAX_PATH];
+    PreviousLogPath(prev, sizeof(prev));
+    fclose(g_log.file);
+    DeleteFileA(prev);
+    bool moved = MoveFileA(g_files.logPath, prev) != 0;
+    // A capture reading the log right now keeps it from being renamed:
+    // carry on in it and try again after another MB.
+    g_log.file = _fsopen(g_files.logPath, moved ? "w" : "a", _SH_DENYWR);
+    if (!moved) { g_log.rollRetryAt = g_log.bytes + (1L << 20); return; }
+    g_log.bytes = 0;
+    g_log.rollRetryAt = 0;
+    ++g_log.segment;
+    if (!g_log.file) return;
+    if (g_log.head) fwrite(g_log.head, 1, g_log.headLen, g_log.file);
+    const char* name = strrchr(prev, '\\');
+    int n = fprintf(g_log.file, "%s (part %d): the part before this is in %s ---\n", LOG_ROLL_MARK, g_log.segment,
+                    name ? name + 1 : prev);
+    g_log.bytes = (long)g_log.headLen + (n > 0 ? n : 0);
+}
 
 // stampTicks < 0: stamp with now. Stamps are written at Logging 2 only.
 static void LogWriteAt(LONGLONG stampTicks, const char* fmt, va_list ap)
 {
+    char stack[2048];
+    char* text = stack;
+    int pre = 0;
+    if (g_cfg.logging == 2)
+        pre = _snprintf_s(stack, sizeof(stack), _TRUNCATE, "%10.3f| ", Ms((stampTicks < 0 ? Now() : stampTicks) - g_qpc0));
+    if (pre < 0) pre = 0;
+    va_list count;
+    va_copy(count, ap);
+    int body = _vscprintf(fmt, count);
+    va_end(count);
+    if (body < 0) return;
+    size_t need = (size_t)pre + body + 2;
+    if (need > sizeof(stack))
+    {
+        text = (char*)malloc(need);
+        if (!text) return;
+        memcpy(text, stack, pre);
+    }
+    vsnprintf(text + pre, need - pre, fmt, ap);
+    size_t len = (size_t)pre + body;
+    text[len++] = '\n';
+
     EnsureCs(g_log.cs);
     EnterCriticalSection(&g_log.cs.cs);
-    if (g_log.capped) { LeaveCriticalSection(&g_log.cs.cs); return; }
-    if (!g_log.file) g_log.file = _fsopen(g_files.logPath, "w", _SH_DENYWR);
+    if (!g_log.file)
+    {
+        char prev[MAX_PATH];   // the last launch's, if it rolled
+        PreviousLogPath(prev, sizeof(prev));
+        DeleteFileA(prev);
+        g_log.file = _fsopen(g_files.logPath, "w", _SH_DENYWR);
+    }
     if (g_log.file)
     {
-        int n = 0;
-        if (g_cfg.logging == 2)
-            n += fprintf(g_log.file, "%10.3f| ", Ms((stampTicks < 0 ? Now() : stampTicks) - g_qpc0));
-        n += vfprintf(g_log.file, fmt, ap);
-        fputc('\n', g_log.file); n += 1;
-        if (n > 0) g_log.bytes += n;
-        if (g_log.bytes > LOG_CAP_BYTES)
-        {
-            fprintf(g_log.file, "log stopped (%ld MB size cap reached): log restarts at next game launch\n",
-                    LOG_CAP_BYTES / (1024 * 1024));
-            g_log.capped = true;
-        }
-        fflush(g_log.file);
+        fwrite(text, 1, len, g_log.file);
+        g_log.bytes += (long)len;
+        if (!g_log.headDone || strncmp(text + pre, "setup:", 6) == 0) LogKeepHead(text, len);
+        if (!g_log.headDone && strstr(text + pre, "--- ishimurapatch init done ---")) g_log.headDone = true;
+        if (g_log.bytes > LOG_SEGMENT_BYTES && g_log.bytes >= g_log.rollRetryAt) LogRoll();
+        if (g_log.file) fflush(g_log.file);
     }
     LeaveCriticalSection(&g_log.cs.cs);
+    if (text != stack) free(text);
 }
 static void Log(const char* fmt, ...)
 {
@@ -2431,6 +2514,41 @@ static bool GameHasFocus()
     return pid == GetCurrentProcessId();
 }
 
+// A line's stamp ("%10.3f| " at Logging 2), or -1 for an unstamped line.
+static double StampOf(const char* line)
+{
+    for (int i = 0; i < 16 && line[i] && line[i] != '\n'; ++i)
+        if (line[i] == '|') return atof(line);
+    return -1.0;
+}
+
+// Copies the lines of text that belong in a capture: the session's start
+// (while *header, up to "init done"), setup lines, and every line stamped
+// from `from` on.
+static void CaptureCopy(FILE* out, char* text, double from, bool* header, bool* said)
+{
+    for (char* line = text; *line; )
+    {
+        char* end = strchr(line, '\n');
+        size_t n = end ? (size_t)(end - line + 1) : strlen(line);
+        // The searches stop at this line's end: unbounded, each one ran to
+        // the end of the whole log, and a capture of an 8 MB log never
+        // finished (0.1.1 in-game, 10/18).
+        if (end) *end = 0;
+        // a stamped line reads "%10.3f| "; setup lines are kept whatever their stamp
+        char* bar = (char*)memchr(line, '|', n < 16 ? n : 16);
+        double stamp = bar ? atof(line) : -1.0;
+        bool setup = strstr(line, "| setup:") != NULL;
+        bool done = *header && strstr(line, "--- ishimurapatch init done ---") != NULL;
+        if (end) *end = '\n';
+        bool inWindow = stamp >= from;
+        if (!*header && inWindow && !*said) { fputs("... (the log up to the last minute left out, setup lines kept)\r\n", out); *said = true; }
+        if (*header || inWindow || setup) fwrite(line, 1, n, out);
+        if (done) *header = false;
+        line += n;
+    }
+}
+
 static DWORD WINAPI CaptureLog(LPVOID param)
 {
     double stampNow = *(double*)&param;
@@ -2455,26 +2573,42 @@ static DWORD WINAPI CaptureLog(LPVOID param)
     if (fopen_s(&out, path, "wb") != 0 || !out) { free(buf); Log("CAPTURE: could not write %s", path); InterlockedExchange(&g_captureBusy, 0); return 0; }
     double from = stampNow - CAPTURE_WINDOW_MS;
     bool header = true, said = false;
-    for (char* line = buf; *line; )
+    // After a roll the log opens with the session's start and the roll mark:
+    // copy that, then the window's part from the previous segment if the
+    // window reaches back past the roll, then the rest.
+    char* body = buf;
+    char* mark = strstr(buf, LOG_ROLL_MARK);
+    if (mark)
     {
-        char* end = strchr(line, '\n');
-        size_t n = end ? (size_t)(end - line + 1) : strlen(line);
-        // The searches stop at this line's end: unbounded, each one ran to
-        // the end of the whole log, and a capture of an 8 MB log never
-        // finished (0.1.1 in-game, 10/18).
-        if (end) *end = 0;
-        // a stamped line reads "%10.3f| "; setup lines are kept whatever their stamp
-        char* bar = (char*)memchr(line, '|', n < 16 ? n : 16);
-        double stamp = bar ? atof(line) : -1.0;
-        bool setup = strstr(line, "| setup:") != NULL;
-        bool done = header && strstr(line, "--- ishimurapatch init done ---") != NULL;
-        if (end) *end = '\n';
-        bool inWindow = stamp >= from;
-        if (!header && inWindow && !said) { fputs("... (the log up to the last minute left out, setup lines kept)\r\n", out); said = true; }
-        if (header || inWindow || setup) fwrite(line, 1, n, out);
-        if (done) header = false;
-        line += n;
+        char* eol = strchr(mark, '\n');
+        body = eol ? eol + 1 : mark + strlen(mark);
+        char keep = *body;
+        *body = 0;
+        CaptureCopy(out, buf, from, &header, &said);
+        *body = keep;
+        header = false;
+        char* first = body;   // the first stamped line after the roll
+        while (*first && StampOf(first) < 0) { char* e = strchr(first, '\n'); first = e ? e + 1 : first + strlen(first); }
+        if (!*first || StampOf(first) > from)
+        {
+            char prev[MAX_PATH];
+            PreviousLogPath(prev, sizeof(prev));
+            FILE* p = _fsopen(prev, "rb", _SH_DENYNO);
+            char* line = p ? (char*)malloc(65536) : NULL;
+            bool started = false;   // its start and setup lines are in the copy above
+            while (line && fgets(line, 65536, p))
+            {
+                if (!started) { started = strstr(line, "--- ishimurapatch init done ---") != NULL; continue; }
+                double stamp = StampOf(line);
+                if (stamp < 0 || stamp < from || strstr(line, "| setup:")) continue;
+                if (!said) { fputs("... (the log up to the last minute left out, setup lines kept)\r\n", out); said = true; }
+                fputs(line, out);
+            }
+            free(line);
+            if (p) fclose(p);
+        }
     }
+    CaptureCopy(out, body, from, &header, &said);
     fclose(out);
     free(buf);
     Log("CAPTURE: saved to %s", path);
