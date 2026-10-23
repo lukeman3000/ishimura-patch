@@ -101,7 +101,7 @@ static Files g_files;
 
 struct Config
 {
-    int  logging = 1;
+    int  logging = 2;
     int  hitchMs = 20;
     char captureKey[32] = "F8";
     int  suballocate = 1;
@@ -271,14 +271,14 @@ static const char* DEFAULT_INI =
 "; it becomes ishimurapatch.previous.log and a new one starts, so a long\n"
 "; session keeps the latest 128-256 MB.\n"
 ";  0 = off\n"
-";  1 = on (default): what was hooked and any errors, then nothing more\n"
-";  2 = also one HITCH line for every frame at least HitchMs long, a STATS\n"
-";      line every 30 seconds, and the mark key's MARK lines. About 1 MB an\n"
-";      hour; fine for long sessions.\n"
+";  1 = what was hooked and any errors, then nothing more\n"
+";  2 = (default) also one HITCH line for every frame at least HitchMs\n"
+";      long, a STATS line every 30 seconds, and the mark key's MARK lines.\n"
+";      About 1 MB an hour; fine for long sessions.\n"
 ";  3 = everything (read at launch): also every GPU memory request and\n"
 ";      every frame, stamped in ms since the game started. Roughly 10-15 MB\n"
 ";      a minute; turn it on to reproduce a problem, then send the log.\n"
-"Logging = 1\n"
+"Logging = 2\n"
 "\n"
 "; A frame at least this long (ms) gets a HITCH line (Logging 2 and 3).\n"
 "HitchMs = 20\n"
