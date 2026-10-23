@@ -41,8 +41,10 @@
 //  UPLOAD and READBACK buffers get their own pools, and blocks are made
 //  ahead of need on a background thread instead of mid-burst.
 //
-//  Logging (ishimurapatch.ini): 1 = what was hooked, a HITCH line per slow
-//  frame, a STATS line every 30 s. 2 = also every request and every frame,
+//  Logging (ishimurapatch.ini), ordered by detail as in Mouse Fix: 1 = what
+//  was hooked and any errors, then quiet. 2 = also a HITCH line per slow
+//  frame, a STATS line every 30 s, the queues, pool growth, the player's keys
+//  and live ini changes (Log2). 3 = also every request and every frame,
 //  written by a background thread from a lock-free ring so the hooks never
 //  touch the file; the capture key saves the last minute to its own file.
 // ============================================================================
@@ -233,21 +235,23 @@ static const char* DEFAULT_INI =
 "; it becomes ishimurapatch.previous.log and a new one starts, so a long\n"
 "; session keeps the latest 128-256 MB.\n"
 ";  0 = off\n"
-";  1 = on (default): what was hooked, one HITCH line for every frame at\n"
-";      least HitchMs long, and a STATS line every 30 seconds\n"
-";  2 = verbose (read at launch): also every GPU memory request and every\n"
-";      frame, stamped in ms since the game started. Roughly 10-15 MB a\n"
-";      minute; only worth turning on for a test run.\n"
+";  1 = on (default): what was hooked and any errors, then nothing more\n"
+";  2 = also one HITCH line for every frame at least HitchMs long, a STATS\n"
+";      line every 30 seconds, and the mark key's MARK lines. About 1 MB an\n"
+";      hour; fine for long sessions.\n"
+";  3 = everything (read at launch): also every GPU memory request and\n"
+";      every frame, stamped in ms since the game started. Roughly 10-15 MB\n"
+";      a minute; turn it on to reproduce a problem, then send the log.\n"
 "Logging = 1\n"
 "\n"
-"; A frame at least this long (ms) gets a HITCH line.\n"
+"; A frame at least this long (ms) gets a HITCH line (Logging 2 and 3).\n"
 "HitchMs = 20\n"
 "\n"
 "; Press this key right after a stutter or anything odd, and the mod marks\n"
 "; the moment in the log (a numbered MARK line with the time) and plays a\n"
-"; rising chime. At Logging = 2 it also saves the last minute of the log to\n"
-"; its own file, ishimurapatch_capture_<date>_<time>.log, which a relaunch\n"
-"; does not overwrite. F1-F12 or a letter; empty = off.\n"
+"; rising chime (Logging 2 and 3). At Logging = 3 it also saves the last\n"
+"; minute of the log to its own file, ishimurapatch_capture_<date>_<time>.log,\n"
+"; which a relaunch does not overwrite. F1-F12 or a letter; empty = off.\n"
 "CaptureKey = F8\n"
 "\n"
 "\n"
@@ -322,7 +326,7 @@ static void ReadConfig(Config& c, const Config& fb)
     c.raiseDirectQueue = GetPrivateProfileIntA("Advanced", "RaiseDirectQueue", fb.raiseDirectQueue, ini) ? 1 : 0;
     c.raiseCopyQueue   = GetPrivateProfileIntA("Fix", "RaiseCopyQueue", fb.raiseCopyQueue, ini) ? 1 : 0;
 
-    if (c.logging < 0 || c.logging > 2) c.logging = fb.logging;
+    if (c.logging < 0 || c.logging > 3) c.logging = fb.logging;
     if (c.hitchMs < 1) c.hitchMs = fb.hitchMs;
     if (c.blockMB < 16 || c.blockMB > 256) c.blockMB = fb.blockMB;
     if (c.prewarmBlocks < 0 || c.prewarmBlocks > 16) c.prewarmBlocks = fb.prewarmBlocks;
@@ -391,7 +395,7 @@ static void EnsureCs(LazyCs& l)
 
 // The log rolls: at LOG_SEGMENT_BYTES, ishimurapatch.log becomes
 // ishimurapatch.previous.log (replacing the one before) and a new one starts,
-// so a long Logging 2 session keeps going (and F8 keeps working) in at most
+// so a long Logging 3 session keeps going (and F8 keeps working) in at most
 // two segments on disk. Each new segment opens with the session's start
 // (everything up to "init done") and every setup line so far, so a segment,
 // or a capture cut from one, always says which build and settings ran.
@@ -460,13 +464,13 @@ static void LogRoll()
     g_log.bytes = (long)g_log.headLen + (n > 0 ? n : 0);
 }
 
-// stampTicks < 0: stamp with now. Stamps are written at Logging 2 only.
+// stampTicks < 0: stamp with now. Stamps are written at Logging 3 only.
 static void LogWriteAt(LONGLONG stampTicks, const char* fmt, va_list ap)
 {
     char stack[2048];
     char* text = stack;
     int pre = 0;
-    if (g_cfg.logging == 2)
+    if (g_cfg.logging >= 3)
         pre = _snprintf_s(stack, sizeof(stack), _TRUNCATE, "%10.3f| ", Ms((stampTicks < 0 ? Now() : stampTicks) - g_qpc0));
     if (pre < 0) pre = 0;
     va_list count;
@@ -515,6 +519,13 @@ static void LogAt(LONGLONG stampTicks, const char* fmt, ...)
 {
     if (!g_cfg.logging || !g_files.logPath[0]) return;
     va_list ap; va_start(ap, fmt); LogWriteAt(stampTicks, fmt, ap); va_end(ap);
+}
+// Lines that come during play (Logging 2 and 3); Logging 1 stays quiet after
+// startup, with errors only.
+static void Log2(const char* fmt, ...)
+{
+    if (g_cfg.logging < 2 || !g_files.logPath[0]) return;
+    va_list ap; va_start(ap, fmt); LogWriteAt(-1, fmt, ap); va_end(ap);
 }
 
 #include "frostbite.h"   // type records, memory scans, live settings objects
@@ -602,7 +613,7 @@ struct FrameAcc
 static FrameAcc g_frame;
 
 // ----------------------------------------------------------------------------
-// The event ring (Logging 2): hooks claim a slot with one interlocked add,
+// The event ring (Logging 3): hooks claim a slot with one interlocked add,
 // fill it and publish it with its sequence number; the writer thread drains
 // it into the log. A lapped slot is counted as dropped, never blocked on.
 // ----------------------------------------------------------------------------
@@ -668,7 +679,7 @@ static void Finish(const CallScope& s, Kind k, HRESULT hr, UINT64 bytes,
     InterlockedAdd64(&ts.waitTicks, wait);
     InterlockedIncrement(&ts.creates);
 
-    if (g_cfg.logging == 2 && g_ring)
+    if (g_cfg.logging >= 3 && g_ring)
     {
         LONG64 idx;
         Event* e = RingClaim(idx);
@@ -880,7 +891,7 @@ static SubBlock* SubGrow(SubPool& p, const char* why)
     dev->Release();
     if (!room) return NULL;
     if (why)
-        Log("SUB: %s block %ld added (%s, %.1f ms) | %.0f MB pooled, %.1f MB used", p.name, p.count, why, ms,
+        Log2("SUB: %s block %ld added (%s, %.1f ms) | %.0f MB pooled, %.1f MB used", p.name, p.count, why, ms,
             PoolMB(p.totalPages), PoolMB(p.totalPages - p.freePages));
     return b;
 }
@@ -1524,7 +1535,7 @@ static void OnFrame()
     g_stats.createMs += Ms(ct); g_stats.waitMs += Ms(wt);
     if (hitch) g_stats.hitches++;
 
-    if (g_cfg.logging == 2 && g_ring)
+    if (g_cfg.logging >= 3 && g_ring)
     {
         LONG64 idx;
         Event* e = RingClaim(idx);
@@ -1534,13 +1545,13 @@ static void OnFrame()
         RingPublish(e, idx);
     }
 
-    if (hitch && g_cfg.logging)
+    if (hitch && g_cfg.logging >= 2)
     {
         char tops[256]; int p = 0; tops[0] = 0;
         for (int k = 0; k < 3 && top[k].slot >= 0; ++k)
             p += _snprintf_s(tops + p, sizeof(tops) - p, _TRUNCATE, "%s%s %.1f ms/%ld (wait %.1f)",
                              k ? ", " : "", g_slots[top[k].slot].name, Ms(top[k].ticks), top[k].n, Ms(top[k].wait));
-        Log("HITCH %.1f ms | creates %ld (committed %ld, sub %ld, heap %ld, placed %ld, reserved %ld, residency %ld) %.1f MB"
+        Log2("HITCH %.1f ms | creates %ld (committed %ld, sub %ld, heap %ld, placed %ld, reserved %ld, residency %ld) %.1f MB"
             " | thread-ms in creates %.1f (residency wait %.1f) | other KMT waits %.1f | fix %s | top: %s",
             ms, creates, cnt[C_COMMITTED], cnt[C_SUB], cnt[C_HEAP], cnt[C_PLACED], cnt[C_RESERVED], cnt[C_RESIDENCY],
             by / 1048576.0, Ms(ct), Ms(wt), Ms(ot), g_sub.on ? "on" : "off", tops[0] ? tops : "-");
@@ -1548,7 +1559,7 @@ static void OnFrame()
 
     if (Ms(now - g_stats.windowStart) >= 30000.0)
     {
-        Log("STATS %.0f s: %ld frames, avg %.2f ms, worst %.1f ms, hitches %ld | creates %ld (%.1f/frame) %.1f MB"
+        Log2("STATS %.0f s: %ld frames, avg %.2f ms, worst %.1f ms, hitches %ld | creates %ld (%.1f/frame) %.1f MB"
             " | thread-ms in creates %.1f (residency wait %.1f)",
             Ms(now - g_stats.windowStart) / 1000.0, g_stats.frames, g_stats.frameMs / (g_stats.frames ? g_stats.frames : 1),
             g_stats.worstMs, g_stats.hitches, g_stats.creates,
@@ -1557,7 +1568,7 @@ static void OnFrame()
         {
             char sum[256];
             SubSummary(sum, sizeof(sum));
-            Log("SUB fix %s | %s | %ld live, %ld made, %ld fell back (%ld at a pool cap), %ld block failures",
+            Log2("SUB fix %s | %s | %ld live, %ld made, %ld fell back (%ld at a pool cap), %ld block failures",
                 g_sub.on ? "on" : "off", sum, g_sub.live, g_sub.made, g_sub.fellBack, g_sub.capped, g_sub.heapFails);
         }
         LONGLONG keepLast = g_stats.last;
@@ -1732,7 +1743,7 @@ static DWORD WINAPI ThrottleThread(LPVOID)
         if (!g_cfg.dataReadMBs) continue;
         LONGLONG r = g_thReads, b = g_thBytes, d = g_thDelayTicks;
         if (r == reads) continue;
-        Log("THROTTLE at %.0f s: %lld MB of game data in %lld reads in the last 5 s, %.0f ms of waiting"
+        Log2("THROTTLE at %.0f s: %lld MB of game data in %lld reads in the last 5 s, %.0f ms of waiting"
             " (cap %d MB/s); %lld larger reads of other files passed straight through",
             Ms(Now() - g_qpc0) / 1000.0, (b - bytes) >> 20, r - reads, Ms(d - delay), g_cfg.dataReadMBs, g_thPassed);
         reads = r; bytes = b; delay = d;
@@ -1910,7 +1921,7 @@ static DWORD WINAPI EngineThread(LPVOID)
                     {
                         strncpy_s(s.r.val, sizeof(s.r.val), want[i].val, _TRUNCATE);
                         s.restored = 0;
-                        Log("ENGINE: %s.%s = %s (live)", s.r.cls, s.r.fld, s.r.val);
+                        Log2("ENGINE: %s.%s = %s (live)", s.r.cls, s.r.fld, s.r.val);
                         if (s.resolved && EncodeSetting(s.r)) ApplySetting(s.r, "ENGINE: set");
                     }
                     continue;
@@ -1920,13 +1931,13 @@ static DWORD WINAPI EngineThread(LPVOID)
                 strncpy_s(s.r.fld, sizeof(s.r.fld), want[i].fld, _TRUNCATE);
                 strncpy_s(s.r.val, sizeof(s.r.val), want[i].val, _TRUNCATE);
                 s.addedTick = tick;
-                if (tick) Log("ENGINE: %s.%s = %s added (live)", s.r.cls, s.r.fld, s.r.val);
+                if (tick) Log2("ENGINE: %s.%s = %s added (live)", s.r.cls, s.r.fld, s.r.val);
             }
             for (int j = 0; j < n; ++j)
             {
                 if (taken[j]) continue;
                 bool ours = SettingWritten(slots[j].r);
-                Log("ENGINE: %s.%s taken out (live)%s", slots[j].r.cls, slots[j].r.fld,
+                Log2("ENGINE: %s.%s taken out (live)%s", slots[j].r.cls, slots[j].r.fld,
                     ours ? " - the game's own value goes back" : " - it was never changed");
                 if (ours) PutBackSetting(slots[j].r, "ENGINE: put back");
             }
@@ -2293,7 +2304,7 @@ static DWORD WINAPI QueueStatsThread(LPVOID)
     {
         Sleep(500);
         LONG n = g_nQueues; if (n > MAX_QUEUES) n = MAX_QUEUES;
-        if (!n || !g_cfg.logging) continue;
+        if (!n || g_cfg.logging < 2) continue;
         char line[1024]; int p = 0; line[0] = 0;
         for (int i = 0; i < n; ++i)
         {
@@ -2312,7 +2323,7 @@ static DWORD WINAPI QueueStatsThread(LPVOID)
             p += _snprintf_s(line + p, sizeof(line) - p, _TRUNCATE, "%sQ%d %.1s %ld/%ld s%ld w%ld%s%s%s",
                              p ? " | " : "", i, QueueType(q.type), s, l, sg, w, on[0] ? " (" : "", on, on[0] ? ")" : "");
         }
-        if (p) Log("QUEUES at %.0f s (submits/lists, signals, waits): %s", Ms(Now() - g_qpc0) / 1000.0, line);
+        if (p) Log2("QUEUES at %.0f s (submits/lists, signals, waits): %s", Ms(Now() - g_qpc0) / 1000.0, line);
     }
 }
 
@@ -2405,7 +2416,7 @@ static DWORD WINAPI FallbackThread(LPVOID)
 }
 
 // ----------------------------------------------------------------------------
-// The writer (Logging 2): drains the ring into the log every 100 ms
+// The writer (Logging 3): drains the ring into the log every 100 ms
 // ----------------------------------------------------------------------------
 static const char* HeapTypeName(unsigned t)
 {
@@ -2489,7 +2500,7 @@ static DWORD WINAPI WriterThread(LPVOID)
 }
 
 // ----------------------------------------------------------------------------
-// The capture key (Logging 2): the Mouse Fix capture, by ms stamps
+// The capture key (Logging 3): the Mouse Fix capture, by ms stamps
 // ----------------------------------------------------------------------------
 static const double CAPTURE_WINDOW_MS = 60000.0;
 static volatile LONG g_captureBusy = 0;
@@ -2514,7 +2525,7 @@ static bool GameHasFocus()
     return pid == GetCurrentProcessId();
 }
 
-// A line's stamp ("%10.3f| " at Logging 2), or -1 for an unstamped line.
+// A line's stamp ("%10.3f| " at Logging 3), or -1 for an unstamped line.
 static double StampOf(const char* line)
 {
     for (int i = 0; i < 16 && line[i] && line[i] != '\n'; ++i)
@@ -2716,7 +2727,7 @@ static void PlayChime(bool on)
     if (wav) PlaySoundA((LPCSTR)wav, NULL, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
 }
 
-// The mark key (any logging; also saves a capture at Logging 2) and the fix's
+// The mark key (Logging 2 and 3; also saves a capture at Logging 3) and the fix's
 // toggle key (any level). Both are
 // looked up again each poll, so a live reload changes them.
 static DWORD WINAPI KeyThread(LPVOID)
@@ -2725,7 +2736,7 @@ static DWORD WINAPI KeyThread(LPVOID)
     for (;;)
     {
         Sleep(30);
-        WORD vk = g_cfg.logging ? KeyVk(g_cfg.captureKey) : 0;
+        WORD vk = g_cfg.logging >= 2 ? KeyVk(g_cfg.captureKey) : 0;
         WORD tk = KeyVk(g_cfg.toggleKey);
         bool tDown = tk && (GetAsyncKeyState(tk) & 0x8000) != 0;
         if (tDown && !tWas && GameHasFocus())
@@ -2743,7 +2754,7 @@ static DWORD WINAPI KeyThread(LPVOID)
                 PlayChime(now != 0);
                 char sum[256];
                 SubSummary(sum, sizeof(sum));
-                Log("FIX: suballocation switched %s by the player%s | %s | %ld live, %ld made, %ld fell back",
+                Log2("FIX: suballocation switched %s by the player%s | %s | %ld live, %ld made, %ld fell back",
                     now ? "ON" : "OFF", saved ? " (saved to the ini)" : " (ini not updated: no Suballocate line in [Fix])",
                     sum, g_sub.live, g_sub.made, g_sub.fellBack);
                 if (now && g_sub.growEvent) SetEvent(g_sub.growEvent);
@@ -2758,10 +2769,10 @@ static DWORD WINAPI KeyThread(LPVOID)
             static int marks = 0;
             SYSTEMTIME st;
             GetLocalTime(&st);
-            Log("MARK %d by the player at %02d:%02d:%02d (%.0f ms)", ++marks, st.wHour, st.wMinute, st.wSecond,
+            Log2("MARK %d by the player at %02d:%02d:%02d (%.0f ms)", ++marks, st.wHour, st.wMinute, st.wSecond,
                 Ms(Now() - g_qpc0));
             PlayChime(true);
-            if (g_cfg.logging == 2 && g_ring && InterlockedCompareExchange(&g_captureBusy, 1, 0) == 0)
+            if (g_cfg.logging >= 3 && g_ring && InterlockedCompareExchange(&g_captureBusy, 1, 0) == 0)
             {
                 Sleep(250);   // let the writer drain the frames up to the key press
                 double stampNow = Ms(Now() - g_qpc0);
@@ -2779,9 +2790,9 @@ static DWORD WINAPI KeyThread(LPVOID)
 
 // ----------------------------------------------------------------------------
 // LIVE CONFIG RELOAD (the Mouse Fix design). Live: Suballocate, ToggleKey,
-// [Engine], Logging 0/1, HitchMs, CaptureKey. Read at launch (a change is
+// [Engine], Logging 0-2, HitchMs, CaptureKey. Read at launch (a change is
 // logged as waiting for the next launch): the pool sizes, which are made
-// once the device exists, Logging 2, whose ring is allocated at init, and
+// once the device exists, Logging 3, whose ring is allocated at init, and
 // Probe, a thread started at init.
 // ----------------------------------------------------------------------------
 static void LoadConfigLive()
@@ -2791,50 +2802,50 @@ static void LoadConfigLive()
         Config fb; fb.logging = g_cfg.logging;
         ReadConfig(c, fb);
     }
-    if (c.logging == 2 && !g_ring) { if (g_cfg.logging != 2) Log("config: Logging = 2 takes effect next launch"); c.logging = g_cfg.logging; }
+    if (c.logging >= 3 && !g_ring) { if (g_cfg.logging < 3) Log("config: Logging = 3 takes effect next launch"); c.logging = g_cfg.logging; }
     if (c.logging != g_cfg.logging)
     {
         if (!c.logging) Log("config: Logging = 0 (live) - the log stops here");
         g_cfg.logging = c.logging;
         Log("config: Logging = %d (live)", g_cfg.logging);
     }
-    if (c.hitchMs != g_cfg.hitchMs) { g_cfg.hitchMs = c.hitchMs; Log("config: HitchMs = %d (live)", g_cfg.hitchMs); }
+    if (c.hitchMs != g_cfg.hitchMs) { g_cfg.hitchMs = c.hitchMs; Log2("config: HitchMs = %d (live)", g_cfg.hitchMs); }
     if (c.maxFps != g_cfg.maxFps)
     {
         g_cfg.maxFps = c.maxFps;
-        if (c.maxFps) Log("config: MaxFps = %d (live)", c.maxFps);
-        else Log("config: MaxFps off (live)");
+        if (c.maxFps) Log2("config: MaxFps = %d (live)", c.maxFps);
+        else Log2("config: MaxFps off (live)");
     }
     if (c.dataReadMBs != g_cfg.dataReadMBs)
     {
         g_cfg.dataReadMBs = c.dataReadMBs;
-        if (c.dataReadMBs) Log("FIX: data reads capped at %d MB/s (live)", c.dataReadMBs);
-        else Log("FIX: data read cap off (live)");
+        if (c.dataReadMBs) Log2("FIX: data reads capped at %d MB/s (live)", c.dataReadMBs);
+        else Log2("FIX: data read cap off (live)");
     }
     if (c.reflex != g_cfg.reflex)
-        Log("config: Reflex = %d - read at launch, so it takes effect next launch", c.reflex);
+        Log2("config: Reflex = %d - read at launch, so it takes effect next launch", c.reflex);
     if (strcmp(c.captureKey, g_cfg.captureKey))
     {
         strcpy_s(g_cfg.captureKey, sizeof(g_cfg.captureKey), c.captureKey);
-        Log("config: CaptureKey = %s (live)", g_cfg.captureKey[0] ? g_cfg.captureKey : "(off)");
+        Log2("config: CaptureKey = %s (live)", g_cfg.captureKey[0] ? g_cfg.captureKey : "(off)");
     }
     if (strcmp(c.toggleKey, g_cfg.toggleKey))
     {
         strcpy_s(g_cfg.toggleKey, sizeof(g_cfg.toggleKey), c.toggleKey);
-        Log("config: ToggleKey = %s (live)", g_cfg.toggleKey[0] ? g_cfg.toggleKey : "(off)");
+        Log2("config: ToggleKey = %s (live)", g_cfg.toggleKey[0] ? g_cfg.toggleKey : "(off)");
     }
     // Only a change in the file switches the fix, so an unrelated save
     // doesn't undo the toggle key.
     if (c.suballocate != g_cfg.suballocate)
     {
         g_cfg.suballocate = c.suballocate;
-        if (!g_sub.tierOk) Log("FIX: Suballocate = %d (live) - applied once the device is set up", c.suballocate);
+        if (!g_sub.tierOk) Log2("FIX: Suballocate = %d (live) - applied once the device is set up", c.suballocate);
         else
         {
             InterlockedExchange(&g_sub.on, c.suballocate);
             char sum[256];
             SubSummary(sum, sizeof(sum));
-            Log("FIX: suballocation switched %s (live) | %s | %ld live, %ld made, %ld fell back",
+            Log2("FIX: suballocation switched %s (live) | %s | %ld live, %ld made, %ld fell back",
                 c.suballocate ? "ON" : "OFF", sum, g_sub.live, g_sub.made, g_sub.fellBack);
             if (c.suballocate && g_sub.growEvent) SetEvent(g_sub.growEvent);
         }
@@ -2854,7 +2865,7 @@ static void LoadConfigLive()
         wait(c.hostBlockMB != g_cfg.hostBlockMB, "HostBlockMB");
         wait(c.maxHostPoolMB != g_cfg.maxHostPoolMB, "MaxHostPoolMB");
         wait(c.probe != g_cfg.probe, "Probe");
-        if (later[0]) Log("config: %s changed - read at launch, so it takes effect next launch", later);
+        if (later[0]) Log2("config: %s changed - read at launch, so it takes effect next launch", later);
     }
     bool engine = c.nEngine != g_cfg.nEngine;
     for (int i = 0; i < c.nEngine && !engine; ++i)
@@ -2870,7 +2881,7 @@ static void LoadConfigLive()
         InterlockedExchange(&g_engineDirty, 1);
         if (g_engineWake) SetEvent(g_engineWake);
     }
-    Log("config reloaded");
+    Log2("config reloaded");
 }
 
 // Watches the ini's timestamp; a save in any editor triggers a live reload
@@ -2899,7 +2910,7 @@ static DWORD WINAPI IniWatchThread(LPVOID)
             static FILETIME lastWarn = { 0, 0 };
             if (CompareFileTime(&fad.ftLastWriteTime, &lastWarn) != 0)
             {
-                Log("ini reload skipped - file looks incomplete");
+                Log2("ini reload skipped - file looks incomplete");
                 lastWarn = fad.ftLastWriteTime;
             }
             continue;
@@ -2967,7 +2978,7 @@ static DWORD WINAPI InitThread(LPVOID)
     Log("clock: QPC frequency %lld, qpc0 %lld (stamps are ms since qpc0; PresentMon's TimeInQPC is the same clock)",
         g_qpcFreq, g_qpc0);
 
-    if (g_cfg.logging == 2)
+    if (g_cfg.logging >= 3)
     {
         g_ring = (Event*)VirtualAlloc(NULL, sizeof(Event) * RING_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!g_ring) Log("ring: allocation FAILED - per-request lines off this session");
@@ -2999,7 +3010,7 @@ static DWORD WINAPI InitThread(LPVOID)
     if ((t = CreateThread(NULL, 0, FallbackThread, NULL, 0, NULL))) CloseHandle(t);
     if ((t = CreateThread(NULL, 0, QueueStatsThread, NULL, 0, NULL))) CloseHandle(t);
     if (o_NtReadFile && (t = CreateThread(NULL, 0, ThrottleThread, NULL, 0, NULL))) CloseHandle(t);
-    if (g_cfg.logging == 2 && g_ring)
+    if (g_cfg.logging >= 3 && g_ring)
         if ((t = CreateThread(NULL, 0, WriterThread, NULL, 0, NULL))) CloseHandle(t);
     if ((t = CreateThread(NULL, 0, KeyThread, NULL, 0, NULL))) CloseHandle(t);
     if (g_cfg.probe && (t = CreateThread(NULL, 0, ProbeWatchThread, NULL, 0, NULL))) CloseHandle(t);
