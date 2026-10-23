@@ -123,6 +123,41 @@ struct Config
 };
 static Config g_cfg;
 
+// Test builds (build.bat test, TEST_BUILD) go to playtesters: the ini is five
+// keys with neutral names in one [Settings] section (everything else keeps
+// its default), the engine setting is one switch, StreamingFix, whose field
+// name is kept out of the binary's plain text, and the log says neutral words
+// (Neutral(), below; the word list is in context/test-build-words.md).
+#ifdef TEST_BUILD
+#define INI_FIX "Settings"
+#define INI_ADV "Settings"
+#define KEY_SUBALLOCATE "MemoryFix"
+#define BUILD_KIND " test build"
+#else
+#define INI_FIX "Fix"
+#define INI_ADV "Advanced"
+#define KEY_SUBALLOCATE "Suballocate"
+#define BUILD_KIND ""
+#endif
+
+#ifdef TEST_BUILD
+template <size_t N> struct Hidden
+{
+    char b[N];
+    constexpr Hidden(const char (&s)[N]) : b{} { for (size_t i = 0; i < N; ++i) b[i] = (char)(s[i] ^ (0x5A + 7 * i)); }
+    void Get(char* out) const { for (size_t i = 0; i < N; ++i) out[i] = (char)(b[i] ^ (0x5A + 7 * i)); }
+};
+static constexpr Hidden<sizeof("ForceLoadStreamingImmediate")> STREAMING_FLD("ForceLoadStreamingImmediate");
+static const char* STREAMING_CLS = "TextureStreamingSettings";   // in the binary anyway (frostbite.h SHAPES)
+
+static const char* DEFAULT_INI =
+"[Settings]\n"
+"MemoryFix = 1\n"
+"StreamingFix = 1\n"
+"ToggleKey = F9\n"
+"CaptureKey = F8\n"
+"Logging = 2\n";
+#else
 static const char* DEFAULT_INI =
 "; ============================================================================\n"
 ";  Dead Space (2023) Ishimura Patch - configuration\n"
@@ -279,6 +314,7 @@ static const char* DEFAULT_INI =
 "; the file this does nothing.\n"
 "; 0 = off (default), 1 = on\n"
 "Probe = 0\n";
+#endif
 
 // One reader for boot and live (the Mouse Fix rule). Every key falls back to
 // `fb` when it is missing: boot passes the declared defaults (a fresh
@@ -288,17 +324,27 @@ static const char* DEFAULT_INI =
 static void ReadConfig(Config& c, const Config& fb)
 {
     const char* ini = g_files.iniPath;
-    c.suballocate   = GetPrivateProfileIntA("Fix", "Suballocate", fb.suballocate, ini) ? 1 : 0;
+    c.suballocate   = GetPrivateProfileIntA(INI_FIX, KEY_SUBALLOCATE, fb.suballocate, ini) ? 1 : 0;
     c.reflex        = GetPrivateProfileIntA("Reflex", "Reflex", fb.reflex, ini) ? 1 : 0;
     c.maxFps        = GetPrivateProfileIntA("FrameRate", "MaxFps", fb.maxFps, ini);
-    c.dataReadMBs   = GetPrivateProfileIntA("Advanced", "DataReadMBs", fb.dataReadMBs, ini);
-    GetPrivateProfileStringA("Fix", "ToggleKey", fb.toggleKey, c.toggleKey, sizeof(c.toggleKey), ini);
-    c.blockMB       = GetPrivateProfileIntA("Fix", "BlockMB", fb.blockMB, ini);
-    c.prewarmBlocks = GetPrivateProfileIntA("Fix", "PrewarmBlocks", fb.prewarmBlocks, ini);
-    c.maxPoolMB     = GetPrivateProfileIntA("Fix", "MaxPoolMB", fb.maxPoolMB, ini);
-    c.maxResourceKB = GetPrivateProfileIntA("Fix", "MaxResourceKB", fb.maxResourceKB, ini);
-    c.hostBlockMB   = GetPrivateProfileIntA("Fix", "HostBlockMB", fb.hostBlockMB, ini);
-    c.maxHostPoolMB = GetPrivateProfileIntA("Fix", "MaxHostPoolMB", fb.maxHostPoolMB, ini);
+    c.dataReadMBs   = GetPrivateProfileIntA(INI_ADV, "DataReadMBs", fb.dataReadMBs, ini);
+    GetPrivateProfileStringA(INI_FIX, "ToggleKey", fb.toggleKey, c.toggleKey, sizeof(c.toggleKey), ini);
+    c.blockMB       = GetPrivateProfileIntA(INI_FIX, "BlockMB", fb.blockMB, ini);
+    c.prewarmBlocks = GetPrivateProfileIntA(INI_FIX, "PrewarmBlocks", fb.prewarmBlocks, ini);
+    c.maxPoolMB     = GetPrivateProfileIntA(INI_FIX, "MaxPoolMB", fb.maxPoolMB, ini);
+    c.maxResourceKB = GetPrivateProfileIntA(INI_FIX, "MaxResourceKB", fb.maxResourceKB, ini);
+    c.hostBlockMB   = GetPrivateProfileIntA(INI_FIX, "HostBlockMB", fb.hostBlockMB, ini);
+    c.maxHostPoolMB = GetPrivateProfileIntA(INI_FIX, "MaxHostPoolMB", fb.maxHostPoolMB, ini);
+#ifdef TEST_BUILD
+    c.nEngine = 0;
+    if (GetPrivateProfileIntA(INI_FIX, "StreamingFix", 1, ini))
+    {
+        auto& e = c.engine[c.nEngine++];
+        strcpy_s(e.cls, sizeof(e.cls), STREAMING_CLS);
+        STREAMING_FLD.Get(e.fld);
+        strcpy_s(e.val, sizeof(e.val), "0");
+    }
+#else
     {
         // [Engine]: every "Class.Field = value" line
         static char sec[8192];
@@ -319,12 +365,13 @@ static void ReadConfig(Config& c, const Config& fb)
             c.nEngine++;
         }
     }
-    c.logging = GetPrivateProfileIntA("Advanced", "Logging", fb.logging, ini);
-    c.hitchMs = GetPrivateProfileIntA("Advanced", "HitchMs", fb.hitchMs, ini);
-    GetPrivateProfileStringA("Advanced", "CaptureKey", fb.captureKey, c.captureKey, sizeof(c.captureKey), ini);
-    c.probe   = GetPrivateProfileIntA("Advanced", "Probe", fb.probe, ini) ? 1 : 0;
-    c.raiseDirectQueue = GetPrivateProfileIntA("Advanced", "RaiseDirectQueue", fb.raiseDirectQueue, ini) ? 1 : 0;
-    c.raiseCopyQueue   = GetPrivateProfileIntA("Fix", "RaiseCopyQueue", fb.raiseCopyQueue, ini) ? 1 : 0;
+#endif
+    c.logging = GetPrivateProfileIntA(INI_ADV, "Logging", fb.logging, ini);
+    c.hitchMs = GetPrivateProfileIntA(INI_ADV, "HitchMs", fb.hitchMs, ini);
+    GetPrivateProfileStringA(INI_ADV, "CaptureKey", fb.captureKey, c.captureKey, sizeof(c.captureKey), ini);
+    c.probe   = GetPrivateProfileIntA(INI_ADV, "Probe", fb.probe, ini) ? 1 : 0;
+    c.raiseDirectQueue = GetPrivateProfileIntA(INI_ADV, "RaiseDirectQueue", fb.raiseDirectQueue, ini) ? 1 : 0;
+    c.raiseCopyQueue   = GetPrivateProfileIntA(INI_FIX, "RaiseCopyQueue", fb.raiseCopyQueue, ini) ? 1 : 0;
 
     if (c.logging < 0 || c.logging > 3) c.logging = fb.logging;
     if (c.hitchMs < 1) c.hitchMs = fb.hitchMs;
@@ -464,6 +511,46 @@ static void LogRoll()
     g_log.bytes = (long)g_log.headLen + (n > 0 ? n : 0);
 }
 
+#ifdef TEST_BUILD
+// The log's revealing names and words, swapped for neutral ones as each line
+// is written. Longest first where one contains another.
+static size_t Neutral(const char* in, size_t n, char* out, size_t cap)
+{
+    static char full[160], fld[64];
+    if (!fld[0])
+    {
+        STREAMING_FLD.Get(fld);
+        _snprintf_s(full, sizeof(full), _TRUNCATE, "%s.%s", STREAMING_CLS, fld);
+    }
+    const char* words[][2] = {
+        { full, "StreamingFix" }, { fld, "StreamingFix" }, { STREAMING_CLS, "StreamingFix" },
+        { "Suballocate", "MemoryFix" },
+        { "suballocation", "memory fix" }, { "suballocated", "taken by the memory fix" },
+        { "SUB: ", "MEM: " }, { "SUB fix", "MEM fix" }, { "[Engine]", "[Streaming]" }, { "ENGINE: ", "STREAMING: " },
+        { "RaiseCopyQueue", "QueueFix" }, { "RaiseDirectQueue", "QueueFix2" },
+        { "pooled", "reserved" }, { "pools", "caches" }, { "pool", "cache" }, { "Pool", "Cache" },
+    };
+    size_t o = 0;
+    for (size_t i = 0; i < n && o + 1 < cap; )
+    {
+        bool hit = false;
+        for (auto& w : words)
+        {
+            size_t k = strlen(w[0]);
+            if (k && i + k <= n && memcmp(in + i, w[0], k) == 0)
+            {
+                size_t m = strlen(w[1]);
+                if (o + m >= cap) return o;
+                memcpy(out + o, w[1], m); o += m; i += k; hit = true;
+                break;
+            }
+        }
+        if (!hit) out[o++] = in[i++];
+    }
+    return o;
+}
+#endif
+
 // stampTicks < 0: stamp with now. Stamps are written at Logging 3 only.
 static void LogWriteAt(LONGLONG stampTicks, const char* fmt, va_list ap)
 {
@@ -488,6 +575,16 @@ static void LogWriteAt(LONGLONG stampTicks, const char* fmt, va_list ap)
     vsnprintf(text + pre, need - pre, fmt, ap);
     size_t len = (size_t)pre + body;
     text[len++] = '\n';
+#ifdef TEST_BUILD
+    {
+        size_t cap = len * 2 + 64;
+        char* swapped = (char*)malloc(cap);
+        if (!swapped) { if (text != stack) free(text); return; }
+        len = Neutral(text, len, swapped, cap);
+        if (text != stack) free(text);
+        text = swapped;
+    }
+#endif
 
     EnsureCs(g_log.cs);
     EnterCriticalSection(&g_log.cs.cs);
@@ -2750,12 +2847,12 @@ static DWORD WINAPI KeyThread(LPVOID)
                 // and the next launch starts the same way. The config is
                 // updated first, so the reload this save triggers is a no-op.
                 g_cfg.suballocate = now;
-                bool saved = IniSetValue("Fix", "Suballocate", now ? "1" : "0");
+                bool saved = IniSetValue(INI_FIX, KEY_SUBALLOCATE, now ? "1" : "0");
                 PlayChime(now != 0);
                 char sum[256];
                 SubSummary(sum, sizeof(sum));
                 Log2("FIX: suballocation switched %s by the player%s | %s | %ld live, %ld made, %ld fell back",
-                    now ? "ON" : "OFF", saved ? " (saved to the ini)" : " (ini not updated: no Suballocate line in [Fix])",
+                    now ? "ON" : "OFF", saved ? " (saved to the ini)" : " (ini not updated: no " KEY_SUBALLOCATE " line in [" INI_FIX "])",
                     sum, g_sub.live, g_sub.made, g_sub.fellBack);
                 if (now && g_sub.growEvent) SetEvent(g_sub.growEvent);
             }
@@ -2953,9 +3050,14 @@ static DWORD WINAPI InitThread(LPVOID)
     char ts[64] = {0};
     ctime_s(ts, sizeof(ts), &now);
     if (ts[0]) { size_t n = strlen(ts); if (n && ts[n - 1] == '\n') ts[n - 1] = '\0'; }
-    Log("--- Ishimura Patch v%s (build %s) --- %s", MOD_VERSION, BUILD_STAMP, ts);
+    Log("--- Ishimura Patch v%s%s (build %s) --- %s", MOD_VERSION, BUILD_KIND, BUILD_STAMP, ts);
     Log(g_files.iniCreated ? "ishimurapatch.ini not found - created with defaults"
                            : "config loaded from ishimurapatch.ini");
+#ifdef TEST_BUILD
+    Log("config: MemoryFix = %d | StreamingFix = %d | ToggleKey = %s | CaptureKey = %s | Logging = %d (the rest: defaults)",
+        g_cfg.suballocate, g_cfg.nEngine ? 1 : 0, g_cfg.toggleKey[0] ? g_cfg.toggleKey : "(off)",
+        g_cfg.captureKey[0] ? g_cfg.captureKey : "(off)", g_cfg.logging);
+#else
     Log("config: Logging = %d | HitchMs = %d | CaptureKey = %s", g_cfg.logging, g_cfg.hitchMs,
         g_cfg.captureKey[0] ? g_cfg.captureKey : "(off)");
     Log("config: Suballocate = %d | ToggleKey = %s | BlockMB = %d | PrewarmBlocks = %d | MaxPoolMB = %d | MaxResourceKB = %d"
@@ -2968,6 +3070,7 @@ static DWORD WINAPI InitThread(LPVOID)
     Log("config: Probe = %d | [Engine] %d setting%s", g_cfg.probe, g_cfg.nEngine, g_cfg.nEngine == 1 ? "" : "s");
     for (int i = 0; i < g_cfg.nEngine; ++i)
         Log("config:   %s.%s = %s", g_cfg.engine[i].cls, g_cfg.engine[i].fld, g_cfg.engine[i].val);
+#endif
     {
         char exe[MAX_PATH] = {};
         GetModuleFileNameA(NULL, exe, MAX_PATH);
