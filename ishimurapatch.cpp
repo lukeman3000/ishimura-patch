@@ -117,6 +117,7 @@ struct Config
     int  dataReadMBs = 0;
     int  maxFps = 0;
     int  raiseDirectQueue = 0;
+    int  subGpuTextures   = 0;
     int  raiseCopyQueue = 1;
     struct { char cls[96], fld[96], val[64]; } engine[16];   // [Engine] Class.Field = value
     int  nEngine = 0;
@@ -307,7 +308,15 @@ static const char* DEFAULT_INI =
 "; 0 = off (default), 1 = on\n"
 "RaiseDirectQueue = 0\n"
 "\n"
-
+"; DEVELOPMENT (live). Also suballocate textures the GPU writes itself (UAV),\n"
+"; such as lighting volumes. Off by default: a GPU-written texture can be\n"
+"; compressed, and in reused memory it can start with an earlier resource's\n"
+"; leftover compression data (one report of a box of colored noise near a\n"
+"; store). GPU-written buffers have no compression data and are always\n"
+"; suballocated; the game makes these textures mostly while loading.\n"
+"; 0 = off (default), 1 = on\n"
+"SuballocateGpuWrittenTextures = 0\n"
+"\n"
 "; DEVELOPMENT (read at launch). Runs ishimurapatch_probe.dll (beside this\n"
 "; file) once each time it changes, from 20 seconds after the game starts:\n"
 "; reverse-engineering code that is rebuilt while the game runs. Without\n"
@@ -371,6 +380,7 @@ static void ReadConfig(Config& c, const Config& fb)
     GetPrivateProfileStringA(INI_ADV, "CaptureKey", fb.captureKey, c.captureKey, sizeof(c.captureKey), ini);
     c.probe   = GetPrivateProfileIntA(INI_ADV, "Probe", fb.probe, ini) ? 1 : 0;
     c.raiseDirectQueue = GetPrivateProfileIntA(INI_ADV, "RaiseDirectQueue", fb.raiseDirectQueue, ini) ? 1 : 0;
+    c.subGpuTextures   = GetPrivateProfileIntA(INI_ADV, "SuballocateGpuWrittenTextures", fb.subGpuTextures, ini) ? 1 : 0;
     c.raiseCopyQueue   = GetPrivateProfileIntA(INI_FIX, "RaiseCopyQueue", fb.raiseCopyQueue, ini) ? 1 : 0;
 
     if (c.logging < 0 || c.logging > 3) c.logging = fb.logging;
@@ -524,7 +534,7 @@ static size_t Neutral(const char* in, size_t n, char* out, size_t cap)
     }
     const char* words[][2] = {
         { full, "StreamingFix" }, { fld, "StreamingFix" }, { STREAMING_CLS, "StreamingFix" },
-        { "Suballocate", "MemoryFix" },
+        { "SuballocateGpuWrittenTextures", "MemoryFixTextures" }, { "Suballocate", "MemoryFix" },
         { "suballocation", "memory fix" }, { "suballocated", "taken by the memory fix" },
         { "SUB: ", "MEM: " }, { "SUB fix", "MEM fix" }, { "[Engine]", "[Streaming]" }, { "ENGINE: ", "STREAMING: " },
         { "RaiseCopyQueue", "QueueFix" }, { "RaiseDirectQueue", "QueueFix2" },
@@ -1343,8 +1353,12 @@ struct SubTracker final : IUnknown
 
 // The shape the game's stutter is made of (see the header): the pool it
 // goes to, or NULL to stay committed. DEFAULT takes buffers and textures
-// (no render target or depth flags: placed ones of those need explicit
-// initialization the game may not do); UPLOAD and READBACK take plain buffers.
+// with no render target or depth flags (placed ones of those need explicit
+// initialization the game may not do), and no texture the GPU writes itself
+// (UAV) unless [Advanced] SuballocateGpuWrittenTextures: such a texture can be
+// compressed, and in reused memory its compression data can be an earlier
+// resource's leftovers. GPU-written buffers have no compression data, so they
+// are taken. UPLOAD and READBACK take plain buffers.
 static SubPool* SubEligible(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf,
                             const D3D12_RESOURCE_DESC* rd, const D3D12_CLEAR_VALUE* cv, void** pp,
                             UINT64& bytes)
@@ -1359,6 +1373,9 @@ static SubPool* SubEligible(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3
     {
     case D3D12_HEAP_TYPE_DEFAULT:
         if (rd->Flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) return NULL;
+        if ((rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && rd->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+            !g_cfg.subGpuTextures)
+            return NULL;
         p = &g_sub.pools[POOL_DEFAULT];
         break;
     case D3D12_HEAP_TYPE_UPLOAD:
@@ -3056,6 +3073,12 @@ static void LoadConfigLive()
         if (c.dataReadMBs) Log2("FIX: data reads capped at %d MB/s (live)", c.dataReadMBs);
         else Log2("FIX: data read cap off (live)");
     }
+    if (c.subGpuTextures != g_cfg.subGpuTextures)
+    {
+        g_cfg.subGpuTextures = c.subGpuTextures;
+        Log2("FIX: GPU-written (UAV) textures %s (live; applies to resources made from now on)",
+            c.subGpuTextures ? "suballocated too" : "left as the game makes them");
+    }
     if (c.reflex != g_cfg.reflex)
         Log2("config: Reflex = %d - read at launch, so it takes effect next launch", c.reflex);
     if (strcmp(c.captureKey, g_cfg.captureKey))
@@ -3203,7 +3226,7 @@ static DWORD WINAPI InitThread(LPVOID)
         g_cfg.maxPoolMB, g_cfg.maxResourceKB, g_cfg.hostBlockMB, g_cfg.maxHostPoolMB);
     Log("config: MaxFps = %d | Reflex = %d | DataReadMBs = %d | RaiseDirectQueue = %d", g_cfg.maxFps, g_cfg.reflex,
         g_cfg.dataReadMBs, g_cfg.raiseDirectQueue);
-    Log("config: RaiseCopyQueue = %d", g_cfg.raiseCopyQueue);
+    Log("config: RaiseCopyQueue = %d | SuballocateGpuWrittenTextures = %d", g_cfg.raiseCopyQueue, g_cfg.subGpuTextures);
     Log("config: Probe = %d | [Engine] %d setting%s", g_cfg.probe, g_cfg.nEngine, g_cfg.nEngine == 1 ? "" : "s");
     for (int i = 0; i < g_cfg.nEngine; ++i)
         Log("config:   %s.%s = %s", g_cfg.engine[i].cls, g_cfg.engine[i].fld, g_cfg.engine[i].val);
