@@ -24,11 +24,11 @@ YOU MAY NOT, WITHOUT THE AUTHOR'S WRITTEN PERMISSION
     else. Link to an official source instead.
   - Use Ishimura Patch, or any part of it, commercially.
 
-Official sources: https://github.com/lukeman3000/ishimura-patch and the
-author's own pages, such as https://ishimurapatch.com.
-
-To ask for permission, contact lukeman3000 through the Ishimura Patch
-Discord: https://discord.gg/sNkn7rF5XV
+Official sources:
+https://github.com/lukeman3000/ishimura-patch
+https://www.nexusmods.com/deadspace2023/mods/155
+https://ishimurapatch.com
+and any other of the author's own pages.
 
 Third-party code in third_party/ keeps its own license (MinHook: see
 third_party/minhook/LICENSE.txt).
