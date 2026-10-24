@@ -95,6 +95,8 @@ struct Files
     HMODULE module = NULL;
     char    iniPath[MAX_PATH] = {};
     char    logPath[MAX_PATH] = {};
+    char    marksPath[MAX_PATH] = {};
+    SYSTEMTIME started = {};   // when the mod loaded, for the marks file's session header
     bool    iniCreated = false;
 };
 static Files g_files;
@@ -283,11 +285,12 @@ static const char* DEFAULT_INI =
 "; A frame at least this long (ms) gets a HITCH line (Logging 2 and 3).\n"
 "HitchMs = 20\n"
 "\n"
-"; Press this key right after a stutter or anything odd, and the mod marks\n"
-"; the moment in the log (a numbered MARK line with the time) and plays a\n"
-"; short beep (Logging 2 and 3). At Logging = 3 it also saves the last\n"
-"; minute of the log to its own file, ishimurapatch_capture_<date>_<time>.log,\n"
-"; which a relaunch does not overwrite. F1-F12 or a letter; empty = off.\n"
+"; Press this key right after a stutter or anything odd (Logging 2 and 3):\n"
+"; a short beep, a numbered line with the time in ishimurapatch_marks.txt\n"
+"; for you to write what happened after it (the file is added to, never\n"
+"; replaced), and a matching MARK line in the log. At Logging = 3 the last\n"
+"; minute of the log is also saved to its own file,\n"
+"; ishimurapatch_capture_<date>_<time>.log. F1-F12 or a letter; empty = off.\n"
 "CaptureKey = F8\n"
 "\n"
 "\n"
@@ -408,6 +411,8 @@ static void LoadConfig()
     slash[1] = 0;
     _snprintf_s(g_files.iniPath, sizeof(g_files.iniPath), _TRUNCATE, "%sishimurapatch.ini", dir);
     _snprintf_s(g_files.logPath, sizeof(g_files.logPath), _TRUNCATE, "%sishimurapatch.log", dir);
+    _snprintf_s(g_files.marksPath, sizeof(g_files.marksPath), _TRUNCATE, "%sishimurapatch_marks.txt", dir);
+    GetLocalTime(&g_files.started);
 
     if (GetFileAttributesA(g_files.iniPath) == INVALID_FILE_ATTRIBUTES)
     {
@@ -2976,9 +2981,34 @@ static void PlayChime(Chime which)
     if (wav) PlaySoundA((LPCSTR)wav, NULL, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
 }
 
-// The mark key (Logging 2 and 3; also saves a capture at Logging 3) and the fix's
-// toggle key (any level). Both are
-// looked up again each poll, so a live reload changes them.
+// One line per mark in ishimurapatch_marks.txt, for the player to write what
+// happened after it. Unlike the log it is added to, never replaced, so a
+// relaunch can't lose the marks; each launch with a mark gets its own header.
+static void WriteMark(int n, const SYSTEMTIME& st)
+{
+    static bool headed = false;
+    bool fresh = GetFileAttributesA(g_files.marksPath) == INVALID_FILE_ATTRIBUTES;
+    FILE* f = _fsopen(g_files.marksPath, "a", _SH_DENYWR);
+    if (!f) return;
+    if (fresh)
+        fprintf(f, "Ishimura Patch marks: one line for each press of the mark key (F8 by default).\n"
+                   "Write what happened and where after each one, then send this file with your\n"
+                   "ishimurapatch.log. For example:\n"
+                   "  mark 1 - 14:02:11 - enemy in the floor at Medical entrance\n");
+    if (!headed)
+    {
+        const SYSTEMTIME& s = g_files.started;
+        fprintf(f, "\n=== game started %04d-%02d-%02d %02d:%02d (Ishimura Patch v%s) ===\n",
+            s.wYear, s.wMonth, s.wDay, s.wHour, s.wMinute, MOD_VERSION);
+        headed = true;
+    }
+    fprintf(f, "mark %d - %02d:%02d:%02d - \n", n, st.wHour, st.wMinute, st.wSecond);
+    fclose(f);
+}
+
+// The mark key (Logging 2 and 3: a beep, the marks file and the log's MARK
+// line; also a capture at Logging 3) and the fix's toggle key (any level).
+// Both are looked up again each poll, so a live reload changes them.
 static DWORD WINAPI KeyThread(LPVOID)
 {
     bool was = false, tWas = false;
@@ -3022,6 +3052,7 @@ static DWORD WINAPI KeyThread(LPVOID)
             GetLocalTime(&st);
             Log2("MARK %d by the player at %02d:%02d:%02d (%.0f ms)", ++marks, st.wHour, st.wMinute, st.wSecond,
                 Ms(Now() - g_qpc0));
+            WriteMark(marks, st);
             PlayChime(CHIME_MARK);
             if (g_cfg.logging >= 3 && g_ring && InterlockedCompareExchange(&g_captureBusy, 1, 0) == 0)
             {
