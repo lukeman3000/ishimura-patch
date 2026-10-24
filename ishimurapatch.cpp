@@ -80,7 +80,7 @@ static const char* BUILD_STAMP = BUILD_ID ", " __DATE__ " " __TIME__;
 
 extern "C" {
 extern const int VT_GetResourceAllocationInfo, VT_CreateCommittedResource, VT_CreateHeap,
-    VT_CreatePlacedResource, VT_CreateReservedResource, VT_MakeResident, VT_Evict,
+    VT_CreatePlacedResource, VT_CreateReservedResource, VT_MakeResident, VT_Evict, VT_GetDeviceRemovedReason,
     VT_EnqueueMakeResident, VT_CreateCommittedResource1, VT_CreateHeap1, VT_CreateReservedResource1,
     VT_CreateCommittedResource2, VT_CreatePlacedResource1, VT_CreateCommittedResource3,
     VT_CreatePlacedResource2, VT_CreateReservedResource2, VT_Present, VT_Present1,
@@ -121,6 +121,7 @@ struct Config
     int  raiseDirectQueue = 0;
     int  subGpuTextures   = 0;
     int  raiseCopyQueue = 1;
+    int  crashInfo = 1;
     struct { char cls[96], fld[96], val[64]; } engine[16];   // [Engine] Class.Field = value
     int  nEngine = 0;
 };
@@ -293,6 +294,19 @@ static const char* DEFAULT_INI =
 "; ishimurapatch_capture_<date>_<time>.log. F1-F12 or a letter; empty = off.\n"
 "CaptureKey = F8\n"
 "\n"
+"; (read at launch) If the game crashes with a GPU error (its \"DirectX\n"
+"; error\" box), save a report for a bug report to\n"
+"; ishimurapatch_crash_<date>_<time>.log. A relaunch doesn't overwrite it;\n"
+"; the newest 10 are kept.\n"
+";  0 = off: no crash reports\n"
+";  1 = on (default): the reason, the mod's memory state, the last 30\n"
+";      seconds of frames and the end of the log. Costs nothing while you play.\n"
+";  2 = also, for a bad memory access, the address and what was there\n"
+";      (Windows' DRED). A very small GPU cost.\n"
+";  3 = also every GPU command, so the report shows what the GPU was doing\n"
+";      when it failed. About 2% of GPU time; for chasing a crash.\n"
+"CrashInfo = 1\n"
+"\n"
 "\n"
 "; DEVELOPMENT (live). Cap how fast the game reads its own data archives,\n"
 "; in MB/s. At a streaming boundary the engine decompresses the new area\n"
@@ -385,8 +399,10 @@ static void ReadConfig(Config& c, const Config& fb)
     c.raiseDirectQueue = GetPrivateProfileIntA(INI_ADV, "RaiseDirectQueue", fb.raiseDirectQueue, ini) ? 1 : 0;
     c.subGpuTextures   = GetPrivateProfileIntA(INI_ADV, "SuballocateGpuWrittenTextures", fb.subGpuTextures, ini) ? 1 : 0;
     c.raiseCopyQueue   = GetPrivateProfileIntA(INI_FIX, "RaiseCopyQueue", fb.raiseCopyQueue, ini) ? 1 : 0;
+    c.crashInfo        = GetPrivateProfileIntA(INI_ADV, "CrashInfo", fb.crashInfo, ini);
 
     if (c.logging < 0 || c.logging > 3) c.logging = fb.logging;
+    if (c.crashInfo < 0 || c.crashInfo > 3) c.crashInfo = fb.crashInfo;
     if (c.hitchMs < 1) c.hitchMs = fb.hitchMs;
     if (c.blockMB < 16 || c.blockMB > 256) c.blockMB = fb.blockMB;
     if (c.prewarmBlocks < 0 || c.prewarmBlocks > 16) c.prewarmBlocks = fb.prewarmBlocks;
@@ -1069,6 +1085,12 @@ static SubBlock* SubGrow(SubPool& p, const char* why)
         return NULL;
     }
     double ms = Ms(Now() - t0);
+    {
+        static volatile LONG serial[POOL_COUNT];   // a name DRED can report if the GPU faults in a block
+        wchar_t nm[64];
+        swprintf_s(nm, L"Ishimura Patch %hs block %ld", p.name, InterlockedIncrement(&serial[&p - g_sub.pools]));
+        heap->SetName(nm);
+    }
     SubBlock* b = new SubBlock();
     b->pool = &p;
     b->heap = heap;
@@ -1735,6 +1757,7 @@ struct Stats
 };
 static Stats g_stats;   // touched by the presenting thread only
 
+static void NoteFrame(LONGLONG end, double ms);   // crash info, below
 static void OnFrame()
 {
     LONGLONG now = Now();
@@ -1775,6 +1798,7 @@ static void OnFrame()
 
     double ms = Ms(ft);
     bool hitch = ms >= g_cfg.hitchMs;
+    NoteFrame(now, ms);
     g_stats.frames++; g_stats.frameMs += ms; if (ms > g_stats.worstMs) g_stats.worstMs = ms;
     g_stats.creates += creates; g_stats.mb += by / 1048576.0;
     g_stats.createMs += Ms(ct); g_stats.waitMs += Ms(wt);
@@ -1881,10 +1905,12 @@ static void LimitFrame()
     g_lim.last = (g_lim.last && now - due < period) ? due : Now();
 }
 
+static void CrashSeen(HRESULT presentHr);   // the crash file, below
 static HRESULT STDMETHODCALLTYPE h_Present(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
     if (!t_inPresent++ && !(flags & DXGI_PRESENT_TEST)) OnFrame();
     HRESULT hr = o_Present(sc, sync, flags);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG) CrashSeen(hr);
     if (t_inPresent == 1 && !(flags & DXGI_PRESENT_TEST)) LimitFrame();
     --t_inPresent;
     return hr;
@@ -1893,6 +1919,7 @@ static HRESULT STDMETHODCALLTYPE h_Present1(IDXGISwapChain1* sc, UINT sync, UINT
 {
     if (!t_inPresent++ && !(flags & DXGI_PRESENT_TEST)) OnFrame();
     HRESULT hr = o_Present1(sc, sync, flags, pp);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG) CrashSeen(hr);
     if (t_inPresent == 1 && !(flags & DXGI_PRESENT_TEST)) LimitFrame();
     --t_inPresent;
     return hr;
@@ -2575,6 +2602,365 @@ static DWORD WINAPI QueueStatsThread(LPVOID)
     }
 }
 
+// ----------------------------------------------------------------------------
+// Crash info ([Advanced] CrashInfo). Windows' DRED is switched on just before
+// the game makes its device (CrashInfo 2: for a bad memory access, the address
+// and what was allocated there; 3: also the GPU work in flight). At 1 there is
+// no DRED and no GPU cost: the report has the reason, the mod's side and the frames. If the device is
+// removed (a GPU hang or fault: the game's "DirectX error" box), all of it
+// goes to ishimurapatch_crash_<date>_<time>.log, which a relaunch doesn't
+// overwrite, with the mod's own state. The pools' heaps carry names
+// ("Ishimura Patch DEFAULT block 3"), so a fault in one of them says so.
+// ----------------------------------------------------------------------------
+struct CrashState
+{
+    bool          dredOn = false;
+    ID3D12Device* dev = NULL;            // a reference, held for the watcher
+    volatile LONG written = 0;
+    // the last frames, for the report: when each ended (QPC) and how long it took
+    static const int RECENT = 8192;
+    LONGLONG      at[RECENT];
+    float         ms[RECENT];
+    volatile LONG n = 0;
+};
+static CrashState g_crash;
+
+static void EnableDred()
+{
+    static bool tried = false;
+    if (tried || !g_cfg.crashInfo) return;
+    tried = true;
+    if (g_cfg.crashInfo < 2)
+    {
+        Log("CRASH INFO: on (a GPU crash is saved to ishimurapatch_crash_<date>_<time>.log; CrashInfo 2 adds Windows' DRED)");
+        return;
+    }
+    typedef HRESULT (WINAPI* PFN_DEBUG)(REFIID, void**);
+    PFN_DEBUG getDebug = (PFN_DEBUG)GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12GetDebugInterface");
+    ID3D12DeviceRemovedExtendedDataSettings* s = NULL;
+    if (getDebug && SUCCEEDED(getDebug(IID_PPV_ARGS(&s))) && s)
+    {
+        // breadcrumbs mark every GPU command (about 2% of GPU time at the lift, uncapped): CrashInfo 3 only
+        s->SetAutoBreadcrumbsEnablement(g_cfg.crashInfo >= 3 ? D3D12_DRED_ENABLEMENT_FORCED_ON : D3D12_DRED_ENABLEMENT_FORCED_OFF);
+        s->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        s->Release();
+        g_crash.dredOn = true;
+        Log("CRASH INFO: on (DRED page faults%s; a GPU crash is saved to ishimurapatch_crash_<date>_<time>.log)",
+            g_cfg.crashInfo >= 3 ? " and breadcrumbs" : "");
+    }
+    else Log("CRASH INFO: DRED not available on this system - a GPU crash still gets a crash file, without the GPU's side");
+}
+
+static void NoteFrame(LONGLONG end, double ms)
+{
+    LONG i = g_crash.n % CrashState::RECENT;
+    g_crash.at[i] = end; g_crash.ms[i] = (float)ms;
+    InterlockedIncrement(&g_crash.n);
+}
+
+static const char* RemovedReason(HRESULT r, const char** meaning)
+{
+    switch ((unsigned long)r)
+    {
+    case 0x887A0006: *meaning = "the GPU took too long on its work and Windows reset it (a hang / TDR)"; return "DXGI_ERROR_DEVICE_HUNG";
+    case 0x887A0005: *meaning = "the driver removed the device (a driver crash or the GPU dropping out)"; return "DXGI_ERROR_DEVICE_REMOVED";
+    case 0x887A0007: *meaning = "the GPU was given an invalid command and had to be reset"; return "DXGI_ERROR_DEVICE_RESET";
+    case 0x887A0020: *meaning = "the driver hit an internal error"; return "DXGI_ERROR_DRIVER_INTERNAL_ERROR";
+    case 0x887A0001: *meaning = "an invalid call"; return "DXGI_ERROR_INVALID_CALL";
+    default:         *meaning = "see the code"; return "other";
+    }
+}
+static const char* BreadcrumbOp(int op)
+{
+    static const char* names[] = { "SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced", "ExecuteIndirect",
+        "Dispatch", "CopyBufferRegion", "CopyTextureRegion", "CopyResource", "CopyTiles", "ResolveSubresource", "ClearRenderTargetView",
+        "ClearUnorderedAccessView", "ClearDepthStencilView", "ResourceBarrier", "ExecuteBundle", "Present", "ResolveQueryData",
+        "BeginSubmission", "EndSubmission", "DecodeFrame", "ProcessFrames", "AtomicCopyBufferUint", "AtomicCopyBufferUint64",
+        "ResolveSubresourceRegion", "WriteBufferImmediate", "DecodeFrame1", "SetProtectedResourceSession", "DecodeFrame2",
+        "ProcessFrames1", "BuildRaytracingAccelerationStructure", "EmitRaytracingAccelerationStructurePostbuildInfo",
+        "CopyRaytracingAccelerationStructure", "DispatchRays", "InitializeMetaCommand", "ExecuteMetaCommand", "EstimateMotion",
+        "ResolveMotionVectorHeap", "SetPipelineState1", "InitializeExtensionCommand", "ExecuteExtensionCommand", "DispatchMesh",
+        "EncodeFrame", "ResolveEncoderOutputMetadata", "Barrier", "BeginCommandList", "DispatchGraph", "SetProgram" };
+    return op >= 0 && op < (int)(sizeof(names) / sizeof(names[0])) ? names[op] : "?";
+}
+static const char* AllocType(int t)
+{
+    switch (t)
+    {
+    case 19: return "command queue"; case 20: return "command allocator"; case 21: return "pipeline state"; case 22: return "command list";
+    case 23: return "fence"; case 24: return "descriptor heap"; case 25: return "heap"; case 27: return "query heap";
+    case 28: return "command signature"; case 29: return "pipeline library"; case 34: return "resource"; case 42: return "state object";
+    default: return "other";
+    }
+}
+static void Wide(char* out, size_t n, const char* a, const wchar_t* w)
+{
+    if (a && *a) { strncpy_s(out, n, a, _TRUNCATE); return; }
+    if (w && *w) { _snprintf_s(out, n, _TRUNCATE, "%ls", w); return; }
+    strncpy_s(out, n, "(no name)", _TRUNCATE);
+}
+
+// The reports are named by date and time, so name order is age order: delete
+// all but the newest `keep`.
+static void CrashKeepNewest(const char* newest, int keep)
+{
+    char dir[MAX_PATH], pat[MAX_PATH];
+    strncpy_s(dir, sizeof(dir), newest, _TRUNCATE);
+    char* slash = strrchr(dir, '\\');
+    if (!slash) return;
+    slash[1] = 0;
+    _snprintf_s(pat, sizeof(pat), _TRUNCATE, "%sishimurapatch_crash_*.log", dir);
+    char names[64][64]; int n = 0;
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do { if (n < 64) strncpy_s(names[n++], sizeof(names[0]), fd.cFileName, _TRUNCATE); } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    qsort(names, n, sizeof(names[0]), [](const void* a, const void* b) { return strcmp((const char*)a, (const char*)b); });
+    for (int i = 0; i < n - keep; ++i)
+    {
+        char old[MAX_PATH];
+        _snprintf_s(old, sizeof(old), _TRUNCATE, "%s%s", dir, names[i]);
+        DeleteFileA(old);
+    }
+}
+
+static void WriteCrashFile(HRESULT reason, const char* seenBy)
+{
+    if (InterlockedCompareExchange(&g_crash.written, 1, 0) != 0) return;
+    SYSTEMTIME st; GetLocalTime(&st);
+    char path[MAX_PATH];
+    strncpy_s(path, sizeof(path), g_files.logPath, _TRUNCATE);
+    char* dot = strrchr(path, '.');
+    if (!dot) return;
+    _snprintf_s(dot, path + sizeof(path) - dot, _TRUNCATE, "_crash_%04d%02d%02d_%02d%02d%02d.log",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    FILE* f = NULL;
+    if (fopen_s(&f, path, "wb") != 0 || !f) { Log("CRASH: the GPU device was removed, but %s could not be written", path); return; }
+    setvbuf(f, NULL, _IONBF, 0);   // straight to disk: if the game quits mid-report, what was written stays, most important first
+    double upS = Ms(Now() - g_qpc0) / 1000.0;
+    const char* meaning;
+    const char* name = RemovedReason(reason, &meaning);
+    fprintf(f, "Ishimura Patch v%s%s (build %s) - crash report\n", MOD_VERSION, BUILD_KIND, BUILD_STAMP);
+    fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d, %.0f s after the game started (seen by %s)\n\n",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, upS, seenBy);
+    fprintf(f, "WHAT HAPPENED\nThe game's graphics device was removed: %s (0x%08lX): %s.\n\n", name, (unsigned long)reason, meaning);
+
+    // the mod's side
+    char sum[256] = "", vram[160] = "";
+    if (g_sub.tierOk) SubSummary(sum, sizeof(sum));
+    VramText(vram, sizeof(vram));
+    fprintf(f, "THE MOD\nMemory fix (Suballocate): %s | %s\n%ld live, %ld made, %ld fell back, %ld block failures, growth held at the budget %ld times, %ld empty blocks given back\n%s\n",
+            g_sub.on ? "on" : "off", sum[0] ? sum : "no pools", g_sub.live, g_sub.made, g_sub.fellBack, g_sub.heapFails,
+            g_sub.budgetHeld, g_sub.givenBack, vram);
+    fprintf(f, "Logging %d | RaiseCopyQueue %d | Reflex %d | MaxFps %d | engine settings %d | CrashInfo %d (DRED %s)\n\n",
+            g_cfg.logging, g_cfg.raiseCopyQueue, g_cfg.reflex, g_cfg.maxFps, g_cfg.nEngine, g_cfg.crashInfo, g_crash.dredOn ? "on" : "off");
+
+    // DRED: the bad memory access, if that's what it was, and the GPU work in flight
+    ID3D12DeviceRemovedExtendedData1* dred = NULL;
+    if (g_crash.dev && g_crash.dredOn && SUCCEEDED(g_crash.dev->QueryInterface(IID_PPV_ARGS(&dred))) && dred)
+    {
+        D3D12_DRED_PAGE_FAULT_OUTPUT1 pf = {};
+        if (SUCCEEDED(dred->GetPageFaultAllocationOutput1(&pf)) && pf.PageFaultVA)
+        {
+            bool ours = false;
+            fprintf(f, "BAD MEMORY ACCESS (page fault) at GPU address 0x%016llX\n", (unsigned long long)pf.PageFaultVA);
+            for (int pass = 0; pass < 2; ++pass)
+            {
+                const D3D12_DRED_ALLOCATION_NODE1* node = pass ? pf.pHeadRecentFreedAllocationNode : pf.pHeadExistingAllocationNode;
+                fprintf(f, "  %s there:%s\n", pass ? "Recently freed" : "Allocated", node ? "" : " none");
+                for (int k = 0; node && k < 40; node = node->pNext, ++k)
+                {
+                    char nm[160]; Wide(nm, sizeof(nm), node->ObjectNameA, node->ObjectNameW);
+                    if (strncmp(nm, "Ishimura Patch", 14) == 0) ours = true;
+                    fprintf(f, "    %s: %s\n", AllocType(node->AllocationType), nm);
+                }
+            }
+            fprintf(f, "  => %s\n\n", ours ? "the address is IN ONE OF THE MOD'S MEMORY BLOCKS"
+                                          : "no memory block of the mod's is listed at the address");
+        }
+        else fprintf(f, "BAD MEMORY ACCESS: none recorded (not a page fault)\n\n");
+
+        D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 bc = {};
+        if (g_cfg.crashInfo < 3) fprintf(f, "GPU WORK IN FLIGHT: not recorded (CrashInfo = 3 records it)\n\n");
+        else if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput1(&bc)))
+        {
+            int lists = 0, shown = 0;
+            for (const D3D12_AUTO_BREADCRUMB_NODE1* n = bc.pHeadAutoBreadcrumbNode; n; n = n->pNext) ++lists;
+            fprintf(f, "GPU WORK IN FLIGHT (DRED breadcrumbs, %d command lists recorded; unfinished ones below)\n", lists);
+            for (const D3D12_AUTO_BREADCRUMB_NODE1* n = bc.pHeadAutoBreadcrumbNode; n && shown < 12; n = n->pNext)
+            {
+                UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+                if (done >= n->BreadcrumbCount) continue;
+                ++shown;
+                char q[96], l[96]; Wide(q, sizeof(q), n->pCommandQueueDebugNameA, n->pCommandQueueDebugNameW);
+                Wide(l, sizeof(l), n->pCommandListDebugNameA, n->pCommandListDebugNameW);
+                fprintf(f, "  queue %s, list %s: %u of %u operations done\n", q, l, done, n->BreadcrumbCount);
+                UINT from = done > 4 ? done - 4 : 0, to = done + 6 < n->BreadcrumbCount ? done + 6 : n->BreadcrumbCount;
+                for (UINT i = from; i < to; ++i)
+                    fprintf(f, "    %s %u %s\n", i < done ? "done" : i == done ? ">>>>" : "    ", i, BreadcrumbOp(n->pCommandHistory[i]));
+            }
+            if (!shown) fprintf(f, "  none unfinished\n");
+            fputc('\n', f);
+        }
+        dred->Release();
+    }
+    else if (g_cfg.crashInfo < 2) fprintf(f, "GPU SIDE: not recorded (CrashInfo = 2 adds what was at a bad memory access, 3 also the GPU's work)\n\n");
+    else fprintf(f, "GPU SIDE: DRED %s, so there is no record of the GPU's work.\n\n", g_crash.dredOn ? "data unavailable" : "was off");
+
+    // the last 30 seconds of frames
+    LONG n = g_crash.n, have = n < CrashState::RECENT ? n : CrashState::RECENT;
+    LONGLONG endAt = n ? g_crash.at[(n - 1) % CrashState::RECENT] : 0;
+    int frames = 0, slow = 0; double sum2 = 0, worst = 0;
+    for (LONG k = 0; k < have; ++k)
+    {
+        LONG i = (n - 1 - k) % CrashState::RECENT;
+        if (Ms(endAt - g_crash.at[i]) > 30000.0) break;
+        ++frames; sum2 += g_crash.ms[i]; if (g_crash.ms[i] > worst) worst = g_crash.ms[i];
+        if (g_crash.ms[i] >= g_cfg.hitchMs) ++slow;
+    }
+    fprintf(f, "THE LAST 30 SECONDS OF FRAMES\n%d frames, avg %.2f ms, worst %.1f ms, %d at %d ms or more; the last frame ended %.1f s before this report\n",
+            frames, frames ? sum2 / frames : 0.0, worst, slow, g_cfg.hitchMs, n ? Ms(Now() - endAt) / 1000.0 : 0.0);
+    for (LONG k = have - 1, listed = 0; k >= 0; --k)
+    {
+        LONG i = (n - 1 - k) % CrashState::RECENT;
+        if (Ms(endAt - g_crash.at[i]) > 30000.0 || g_crash.ms[i] < g_cfg.hitchMs) continue;
+        if (++listed > 60) break;
+        fprintf(f, "  %.1f ms, %.1f s before the last frame\n", g_crash.ms[i], Ms(endAt - g_crash.at[i]) / 1000.0);
+    }
+    fputc('\n', f);
+
+    // the end of the log
+    FILE* in = _fsopen(g_files.logPath, "rb", _SH_DENYNO);
+    if (in)
+    {
+        fseek(in, 0, SEEK_END);
+        long len = ftell(in), take = len < 48 * 1024 ? len : 48 * 1024;
+        fseek(in, len - take, SEEK_SET);
+        char* buf = (char*)malloc((size_t)take + 1);
+        size_t got = buf ? fread(buf, 1, (size_t)take, in) : 0;
+        fclose(in);
+        if (buf)
+        {
+            buf[got] = 0;
+            char* start = take < len ? strchr(buf, '\n') : NULL;
+            fprintf(f, "THE END OF ishimurapatch.log\n%s", start ? start + 1 : buf);
+            free(buf);
+        }
+    }
+    fclose(f);
+    Log("CRASH: the GPU device was removed (%s, 0x%08lX) - details saved to %s", name, (unsigned long)reason, path);
+    CrashKeepNewest(path, 10);
+}
+
+// Polls the device every 50 ms (one cheap call), for a removal the game reports
+// with its own error box, or by quitting, without presenting another frame.
+// The game asking why its device failed (Dead Space's "DirectX error" box comes
+// from this call): the report is written before the answer goes back, so before
+// the game can show its box or quit.
+typedef HRESULT (STDMETHODCALLTYPE* PFN_GDRR)(ID3D12Device*);
+static PFN_GDRR o_GetDeviceRemovedReason;
+static HRESULT DeviceReason() { return o_GetDeviceRemovedReason ? o_GetDeviceRemovedReason(g_crash.dev) : g_crash.dev->GetDeviceRemovedReason(); }
+static HRESULT STDMETHODCALLTYPE h_GetDeviceRemovedReason(ID3D12Device* d)
+{
+    HRESULT r = o_GetDeviceRemovedReason(d);
+    if (r != S_OK && g_cfg.crashInfo && g_crash.dev && !g_crash.written) WriteCrashFile(r, "the game asking why its device failed");
+    return r;
+}
+
+// A failed Present: write the report right here, before the game can exit on it.
+static void CrashSeen(HRESULT presentHr)
+{
+    if (!g_cfg.crashInfo || !g_crash.dev || g_crash.written) return;
+    HRESULT r = DeviceReason();
+    WriteCrashFile(r != S_OK ? r : presentHr, "a failed Present");
+}
+
+static DWORD WINAPI CrashWatchThread(LPVOID)
+{
+    while (!g_crash.written)
+    {
+        Sleep(50);
+        HRESULT r = DeviceReason();
+        if (r != S_OK) { WriteCrashFile(r, "the crash watcher"); break; }
+    }
+    return 0;
+}
+
+#ifdef CRASH_TEST
+// Test builds only (cl /DCRASH_TEST=n): crash the GPU 12 s in, to check the crash file.
+//   1 = remove the device (ID3D12Device5::RemoveDevice)
+//   2 = a bad memory access: WriteBufferImmediate to an address nothing owns
+//   3 = evict the pools' DEFAULT blocks while a buffer in one of them is copied from
+//   4 = the same under memory pressure: 32 GB of other heaps first, so the evicted blocks really leave the card
+static DWORD WINAPI CrashTestThread(LPVOID param)
+{
+    ID3D12Device* dev = (ID3D12Device*)param;
+    Sleep(12000);
+    Log("CRASH TEST %d: starting", CRASH_TEST);
+#if CRASH_TEST == 1
+    ID3D12Device5* d5 = NULL;
+    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d5)))) { d5->RemoveDevice(); d5->Release(); }
+#else
+    D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ID3D12CommandQueue* q = NULL; ID3D12CommandAllocator* al = NULL; ID3D12GraphicsCommandList2* cl = NULL; ID3D12Fence* fe = NULL;
+    dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q));
+    dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&al));
+    dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, al, NULL, IID_PPV_ARGS(&cl));
+    dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fe));
+    q->SetName(L"crash test queue"); cl->SetName(L"crash test list");
+#if CRASH_TEST == 2
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER wp = { 0x7FFF00000000ull, 0xDEADBEEF };
+    cl->WriteBufferImmediate(1, &wp, NULL);
+#else
+    // a small buffer made the game's way, so the memory fix places it in a DEFAULT block
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {}; rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = 65536; rd.Height = 1; rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1; rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* src = NULL; ID3D12Resource* dst = NULL;
+    dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &rd, D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(&src));
+    Log("CRASH TEST 3: source buffer %s (%ld pooled so far)", src ? "made" : "FAILED", g_sub.made);
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL, IID_PPV_ARGS(&dst));
+    ID3D12Pageable* heaps[SUB_MAX_BLOCKS]; UINT nh = 0;
+    AcquireSRWLockShared(&g_sub.lock);
+    SubPool& p = g_sub.pools[POOL_DEFAULT];
+    for (LONG i = 0; i < p.count; ++i) if (p.blocks[i] && p.blocks[i]->heap) heaps[nh++] = p.blocks[i]->heap;
+    ReleaseSRWLockShared(&g_sub.lock);
+    HRESULT he = dev->Evict(nh, heaps);
+    Log("CRASH TEST 3: evicted %u DEFAULT blocks (0x%08lX); copying from a buffer in one", nh, (unsigned long)he);
+#if CRASH_TEST == 4
+    // memory pressure: fill the card past its budget, so Windows has to page the evicted blocks out
+    {
+        D3D12_HEAP_DESC fill = {}; fill.SizeInBytes = 512ull << 20; fill.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        int made = 0;
+        for (int i = 0; i < 64; ++i)
+        {
+            ID3D12Heap* h = NULL;
+            if (FAILED(dev->CreateHeap(&fill, IID_PPV_ARGS(&h))) || !h) break;
+            ++made;   // kept on purpose: the test ends in a crash or the app's exit
+        }
+        char vram[160]; VramText(vram, sizeof(vram));
+        Log("CRASH TEST 4: added %d x 512 MB of other heaps | %s", made, vram);
+        Sleep(2000);
+    }
+#endif
+    if (src && dst) cl->CopyBufferRegion(dst, 0, src, 0, 65536);
+#endif
+    cl->Close();
+    ID3D12CommandList* lists[] = { cl };
+    q->ExecuteCommandLists(1, lists);
+    q->Signal(fe, 1);
+    HANDLE ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    fe->SetEventOnCompletion(1, ev);
+    DWORD w = WaitForSingleObject(ev, 10000);
+    Log("CRASH TEST %d: GPU work %s; device reason now 0x%08lX", CRASH_TEST, w == WAIT_OBJECT_0 ? "finished" : "timed out",
+        (unsigned long)dev->GetDeviceRemovedReason());
+#endif
+    return 0;
+}
+#endif
+
 static void PatchDevice(ID3D12Device* dev, const char* how)
 {
     if (InterlockedCompareExchange(&g_devicePatched, 1, 0) != 0) return;
@@ -2594,6 +2980,18 @@ static void PatchDevice(ID3D12Device* dev, const char* how)
         how, mod, (unsigned long long)((UINT_PTR)vt - base), ver, level ? level : 1);
     g_adapterLuid = dev->GetAdapterLuid();
     InterlockedExchange(&g_adapterKnown, 1);
+    if (g_cfg.crashInfo)
+    {
+        if (g_cfg.crashInfo >= 2 && !g_crash.dredOn) Log("CRASH INFO: the device was made before DRED could be switched on - a crash file has no GPU side");
+        dev->AddRef();
+        g_crash.dev = dev;
+        HANDLE ct = CreateThread(NULL, 0, CrashWatchThread, NULL, 0, NULL);
+        if (ct) CloseHandle(ct);
+    }
+#ifdef CRASH_TEST
+    dev->AddRef();
+    { HANDLE tt = CreateThread(NULL, 0, CrashTestThread, dev, 0, NULL); if (tt) CloseHandle(tt); }
+#endif
 
     struct { int idx; void* det; void** orig; int need; const char* name; } slots[] = {
         { VT_CreateCommandQueue,       (void*)h_CreateCommandQueue,  (void**)&o_CreateCommandQueue,  0, "CreateCommandQueue" },
@@ -2604,6 +3002,7 @@ static void PatchDevice(ID3D12Device* dev, const char* how)
         { VT_CreateReservedResource,   (void*)h_CRR,  (void**)&o_CRR,  0,  "CreateReservedResource" },
         { VT_MakeResident,             (void*)h_MakeResident, (void**)&o_MakeResident, 0, "MakeResident" },
         { VT_Evict,                    (void*)h_Evict, (void**)&o_Evict, 0, "Evict" },
+        { VT_GetDeviceRemovedReason,   (void*)h_GetDeviceRemovedReason, (void**)&o_GetDeviceRemovedReason, 0, "GetDeviceRemovedReason" },
         { VT_EnqueueMakeResident,      (void*)h_Enqueue, (void**)&o_Enqueue, 3, "EnqueueMakeResident" },
         { VT_CreateCommittedResource1, (void*)h_CCR1, (void**)&o_CCR1, 4,  "CreateCommittedResource1" },
         { VT_CreateHeap1,              (void*)h_CH1,  (void**)&o_CH1,  4,  "CreateHeap1" },
@@ -2636,6 +3035,7 @@ static void PatchDevice(ID3D12Device* dev, const char* how)
 
 static HRESULT WINAPI h_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REFIID riid, void** pp)
 {
+    if (!g_devicePatched) EnableDred();   // before the device: DRED settings apply to devices made after them
     HRESULT hr = o_D3D12CreateDevice(adapter, fl, riid, pp);
     if (SUCCEEDED(hr) && pp && *pp && !g_devicePatched)
     {
@@ -3258,7 +3658,7 @@ static DWORD WINAPI InitThread(LPVOID)
     Log("config: MaxFps = %d | Reflex = %d | DataReadMBs = %d | RaiseDirectQueue = %d", g_cfg.maxFps, g_cfg.reflex,
         g_cfg.dataReadMBs, g_cfg.raiseDirectQueue);
     Log("config: RaiseCopyQueue = %d | SuballocateGpuWrittenTextures = %d", g_cfg.raiseCopyQueue, g_cfg.subGpuTextures);
-    Log("config: Probe = %d | [Engine] %d setting%s", g_cfg.probe, g_cfg.nEngine, g_cfg.nEngine == 1 ? "" : "s");
+    Log("config: Probe = %d | CrashInfo = %d | [Engine] %d setting%s", g_cfg.probe, g_cfg.crashInfo, g_cfg.nEngine, g_cfg.nEngine == 1 ? "" : "s");
     for (int i = 0; i < g_cfg.nEngine; ++i)
         Log("config:   %s.%s = %s", g_cfg.engine[i].cls, g_cfg.engine[i].fld, g_cfg.engine[i].val);
 #endif
