@@ -2898,7 +2898,29 @@ static DWORD WINAPI CrashTestThread(LPVOID param)
     ID3D12Device* dev = (ID3D12Device*)param;
     Sleep(12000);
     Log("CRASH TEST %d: starting", CRASH_TEST);
-#if CRASH_TEST == 1
+#if CRASH_TEST == 5
+    // the game's residency calls on a resource the memory fix placed in a block: legal or a device removal?
+    {
+        D3D12_HEAP_PROPERTIES hp5 = {}; hp5.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd5 = {}; rd5.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd5.Width = 65536; rd5.Height = 1; rd5.DepthOrArraySize = 1;
+        rd5.MipLevels = 1; rd5.SampleDesc.Count = 1; rd5.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* r = NULL;
+        dev->CreateCommittedResource(&hp5, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &rd5, D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(&r));
+        Log("CRASH TEST 5: pooled buffer %s (%ld pooled)", r ? "made" : "FAILED", g_sub.made);
+        ID3D12Pageable* pg[] = { r };
+        HRESULT e1 = dev->Evict(1, pg);
+        Log("CRASH TEST 5: Evict on it -> 0x%08lX, device reason 0x%08lX", (unsigned long)e1, (unsigned long)dev->GetDeviceRemovedReason());
+        HRESULT m1 = dev->MakeResident(1, pg);
+        Log("CRASH TEST 5: MakeResident on it -> 0x%08lX, device reason 0x%08lX", (unsigned long)m1, (unsigned long)dev->GetDeviceRemovedReason());
+        ID3D12Device3* d3 = NULL; ID3D12Fence* f5 = NULL;
+        if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d3))) && SUCCEEDED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f5))))
+        {
+            HRESULT q1 = d3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, pg, f5, 1);
+            Sleep(500);
+            Log("CRASH TEST 5: EnqueueMakeResident on it -> 0x%08lX, device reason 0x%08lX", (unsigned long)q1, (unsigned long)dev->GetDeviceRemovedReason());
+        }
+    }
+#elif CRASH_TEST == 1
     ID3D12Device5* d5 = NULL;
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d5)))) { d5->RemoveDevice(); d5->Release(); }
 #else
