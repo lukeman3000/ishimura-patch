@@ -70,7 +70,7 @@
 // The version only changes when a version is released. Which build this is
 // - the commit it was built from, uncommitted changes, when - comes from
 // build.bat (build_id.h) and the compiler, so every log names its exact build.
-static const char* MOD_VERSION = "0.3.9";
+static const char* MOD_VERSION = "0.3.10";
 #if __has_include("build_id.h")
 #include "build_id.h"
 #else
