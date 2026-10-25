@@ -3691,6 +3691,27 @@ static DWORD WINAPI InitThread(LPVOID)
         GetFileAttributesExA(exe, GetFileExInfoStandard, &fa);
         Log("game: %s (%llu bytes)", exe, ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
     }
+    {
+        // The ASI loader's names this game loads at startup. The mod ships as dinput8.dll since 0.3.10
+        // (winmm.dll before); an update that kept the old file leaves two loaders in the folder.
+        static const char* const LOADERS[] = { "dinput8.dll", "winmm.dll", "version.dll" };
+        char dir[MAX_PATH], found[96] = "";
+        strncpy_s(dir, sizeof(dir), g_files.iniPath, _TRUNCATE);
+        char* slash = strrchr(dir, '\\');
+        int n = 0;
+        if (slash)
+            for (const char* name : LOADERS)
+            {
+                strcpy_s(slash + 1, dir + sizeof(dir) - (slash + 1), name);
+                if (GetFileAttributesA(dir) != INVALID_FILE_ATTRIBUTES)
+                    _snprintf_s(found + strlen(found), sizeof(found) - strlen(found), _TRUNCATE, "%s%s", n++ ? ", " : "", name);
+            }
+        if (n > 1)
+            Log("LOADER: %s are in the game folder - more than one ASI loader? Since 0.3.10 the mod ships dinput8.dll: "
+                "delete winmm.dll if it came from an older Ishimura Patch", found);
+        else
+            Log("loader: %s", n ? found : "none of dinput8.dll, winmm.dll, version.dll in the game folder");
+    }
     Log("clock: QPC frequency %lld, qpc0 %lld (stamps are ms since qpc0; PresentMon's TimeInQPC is the same clock)",
         g_qpcFreq, g_qpc0);
 
