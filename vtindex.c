@@ -35,3 +35,10 @@ const int VT_CreateCommandQueue1      = DEV(CreateCommandQueue1);
 const int VT_Q_ExecuteCommandLists    = QUEUE(ExecuteCommandLists);
 const int VT_Q_Signal                 = QUEUE(Signal);
 const int VT_Q_Wait                   = QUEUE(Wait);
+
+// Timed and counted only (pipelines, command allocators): ID3D12Device and ID3D12Device1/2
+const int VT_CreateGraphicsPipelineState = DEV(CreateGraphicsPipelineState);
+const int VT_CreateComputePipelineState  = DEV(CreateComputePipelineState);
+const int VT_CreateCommandAllocator      = DEV(CreateCommandAllocator);
+const int VT_CreatePipelineLibrary       = DEV(CreatePipelineLibrary);
+const int VT_CreatePipelineState         = DEV(CreatePipelineState);

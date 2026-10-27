@@ -60,11 +60,13 @@
 #include <share.h>
 #include <time.h>
 #include <math.h>
+#include <algorithm>
 #include <mmsystem.h>
 #include "third_party/minhook/include/MinHook.h"
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "version.lib")
+#pragma comment(lib, "advapi32.lib")   // RegGetValue, for the SYSTEM line
 #pragma comment(lib, "winmm.lib")   // PlaySound, for the toggle chime
 
 // The version only changes when a version is released. Which build this is
@@ -84,7 +86,9 @@ extern const int VT_GetResourceAllocationInfo, VT_CreateCommittedResource, VT_Cr
     VT_EnqueueMakeResident, VT_CreateCommittedResource1, VT_CreateHeap1, VT_CreateReservedResource1,
     VT_CreateCommittedResource2, VT_CreatePlacedResource1, VT_CreateCommittedResource3,
     VT_CreatePlacedResource2, VT_CreateReservedResource2, VT_Present, VT_Present1,
-    VT_CreateCommandQueue, VT_CreateCommandQueue1, VT_Q_ExecuteCommandLists, VT_Q_Signal, VT_Q_Wait;
+    VT_CreateCommandQueue, VT_CreateCommandQueue1, VT_Q_ExecuteCommandLists, VT_Q_Signal, VT_Q_Wait,
+    VT_CreateGraphicsPipelineState, VT_CreateComputePipelineState, VT_CreateCommandAllocator,
+    VT_CreatePipelineLibrary, VT_CreatePipelineState;
 }
 
 // ----------------------------------------------------------------------------
@@ -194,8 +198,8 @@ static const char* DEFAULT_INI =
 "\n"
 "; Press this key while playing to switch Suballocate on or off, for\n"
 "; comparing the two in one session. A rising chime means on, a falling one\n"
-"; off, and the new value is saved to Suballocate above. F1-F12 or a\n"
-"; letter; empty = off.\n"
+"; off, and the new value is saved to Suballocate above. F1-F12, a\n"
+"; letter, or Mouse4 / Mouse5 (the mouse's side buttons); empty = off.\n"
 "ToggleKey = F9\n"
 "\n"
 "; (read at launch) At a streaming boundary the game's copy queue uploads\n"
@@ -291,7 +295,8 @@ static const char* DEFAULT_INI =
 "; for you to write what happened after it (the file is added to, never\n"
 "; replaced), and a matching MARK line in the log. At Logging = 3 the last\n"
 "; minute of the log is also saved to its own file,\n"
-"; ishimurapatch_capture_<date>_<time>.log. F1-F12 or a letter; empty = off.\n"
+"; ishimurapatch_capture_<date>_<time>.log. F1-F12, a letter, or Mouse4 /\n"
+"; Mouse5 (the mouse's side buttons); empty = off.\n"
 "CaptureKey = F8\n"
 "\n"
 "; (read at launch) If the game crashes with a GPU error (its \"DirectX\n"
@@ -866,6 +871,76 @@ static PFN_RES  o_MakeResident, o_Evict;
 static PFN_ENQ  o_Enqueue;
 
 // ----------------------------------------------------------------------------
+// Pipelines and command allocators: timed and counted, never changed. A
+// pipeline the driver has to compile can take tens of ms on whichever thread
+// asks for it, so a hitch line that shows one points at shaders rather than
+// memory. Command allocators hold GPU memory the engine may never give back
+// (Oblivion Remastered's engine keeps every one it ever made); the running
+// count per queue type shows whether this one does too.
+// ----------------------------------------------------------------------------
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CGPS)(ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CCPS)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CPS)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CPL)(ID3D12Device*, const void*, SIZE_T, REFIID, void**);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CCA)(ID3D12Device*, D3D12_COMMAND_LIST_TYPE, REFIID, void**);
+static PFN_CGPS o_CGPS; static PFN_CCPS o_CCPS; static PFN_CPS o_CPS;
+static PFN_CPL  o_CPL;  static PFN_CCA  o_CCA;
+
+struct PsoAcc
+{
+    volatile LONG   frameCount;       // this frame
+    volatile LONG64 frameTicks;
+    volatile LONG64 frameLongest;
+    volatile LONG   libraries;        // the session
+    volatile LONG   allocators[8];    // the session, by D3D12_COMMAND_LIST_TYPE
+};
+static PsoAcc g_pso;
+
+static void PsoDone(LONGLONG t0)
+{
+    LONGLONG d = Now() - t0;
+    InterlockedIncrement(&g_pso.frameCount);
+    InterlockedAdd64(&g_pso.frameTicks, d);
+    for (LONG64 m = g_pso.frameLongest; d > m; m = g_pso.frameLongest)
+        if (InterlockedCompareExchange64(&g_pso.frameLongest, d, m) == m) break;
+}
+static HRESULT STDMETHODCALLTYPE h_CGPS(ID3D12Device* d, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID riid, void** pp)
+{
+    LONGLONG t0 = Now();
+    HRESULT hr = o_CGPS(d, desc, riid, pp);
+    PsoDone(t0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE h_CCPS(ID3D12Device* d, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc, REFIID riid, void** pp)
+{
+    LONGLONG t0 = Now();
+    HRESULT hr = o_CCPS(d, desc, riid, pp);
+    PsoDone(t0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE h_CPS(ID3D12Device* d, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid, void** pp)
+{
+    LONGLONG t0 = Now();
+    HRESULT hr = o_CPS(d, desc, riid, pp);
+    PsoDone(t0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE h_CPL(ID3D12Device* d, const void* blob, SIZE_T size, REFIID riid, void** pp)
+{
+    HRESULT hr = o_CPL(d, blob, size, riid, pp);
+    if (InterlockedIncrement(&g_pso.libraries) == 1)
+        Log("PIPELINES: the game made a pipeline library (%llu KB from its cache, 0x%08lX) - pipelines loaded from it aren't timed",
+            (unsigned long long)(size >> 10), (unsigned long)hr);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE h_CCA(ID3D12Device* d, D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** pp)
+{
+    HRESULT hr = o_CCA(d, type, riid, pp);
+    if (SUCCEEDED(hr) && (unsigned)type < 8) InterlockedIncrement(&g_pso.allocators[type]);
+    return hr;
+}
+
+// ----------------------------------------------------------------------------
 // Graphics memory: the game's adapter (by the device's LUID) reports how much
 // memory the game uses on the card and in system RAM, against the budget
 // Windows gives it. Past the card's budget Windows moves allocations out to
@@ -894,7 +969,17 @@ static void OpenAdapter()
         {
             DXGI_ADAPTER_DESC2 d = {};
             a->GetDesc2(&d);
-            Log("graphics memory: %ls, %llu MB on the card", d.Description, (unsigned long long)(d.DedicatedVideoMemory >> 20));
+            // The driver's version as Windows lists it; NVIDIA's own number is its last five digits (32.0.15.6614 = 566.14)
+            char drv[64] = "driver version n/a";
+            LARGE_INTEGER v = {};
+            if (SUCCEEDED(a->CheckInterfaceSupport(__uuidof(IDXGIDevice), &v)))
+            {
+                unsigned p3 = HIWORD(v.LowPart), p4 = LOWORD(v.LowPart);
+                int n = _snprintf_s(drv, sizeof(drv), _TRUNCATE, "driver %u.%u.%u.%u", HIWORD(v.HighPart), LOWORD(v.HighPart), p3, p4);
+                if (d.VendorId == 0x10DE && n > 0)
+                    _snprintf_s(drv + n, sizeof(drv) - n, _TRUNCATE, " (NVIDIA %u.%02u)", (p3 % 10) * 100 + p4 / 100, p4 % 100);
+            }
+            Log("graphics memory: %ls, %llu MB on the card | %s", d.Description, (unsigned long long)(d.DedicatedVideoMemory >> 20), drv);
             g_adapter = a;
         }
         fac->Release();
@@ -1752,8 +1837,8 @@ static thread_local int t_inPresent = 0;
 struct Stats
 {
     LONGLONG windowStart = 0, last = 0;
-    LONG     frames = 0, hitches = 0, creates = 0;
-    double   frameMs = 0, worstMs = 0, mb = 0, createMs = 0, waitMs = 0;
+    LONG     frames = 0, hitches = 0, creates = 0, psos = 0;
+    double   frameMs = 0, worstMs = 0, mb = 0, createMs = 0, waitMs = 0, psoMs = 0, psoLongest = 0;
 };
 static Stats g_stats;   // touched by the presenting thread only
 
@@ -1767,6 +1852,8 @@ static void OnFrame()
         for (int c = 0; c < C_COUNT; ++c) InterlockedExchange(&g_frame.count[c], 0);
         InterlockedExchange64(&g_frame.createTicks, 0); InterlockedExchange64(&g_frame.waitTicks, 0);
         InterlockedExchange64(&g_frame.otherWaitTicks, 0); InterlockedExchange64(&g_frame.bytes, 0);
+        InterlockedExchange(&g_pso.frameCount, 0); InterlockedExchange64(&g_pso.frameTicks, 0);
+        InterlockedExchange64(&g_pso.frameLongest, 0);
         return;
     }
     LONGLONG ft = now - g_stats.last;
@@ -1778,6 +1865,9 @@ static void OnFrame()
     LONGLONG wt = InterlockedExchange64(&g_frame.waitTicks, 0);
     LONGLONG ot = InterlockedExchange64(&g_frame.otherWaitTicks, 0);
     LONGLONG by = InterlockedExchange64(&g_frame.bytes, 0);
+    LONG psos = InterlockedExchange(&g_pso.frameCount, 0);
+    double psoMs = Ms(InterlockedExchange64(&g_pso.frameTicks, 0));
+    double psoLongest = Ms(InterlockedExchange64(&g_pso.frameLongest, 0));
 
     // the three threads that spent longest in create calls this frame
     struct Top { int slot; LONGLONG ticks, wait; LONG n; } top[3] = { {-1,0,0,0}, {-1,0,0,0}, {-1,0,0,0} };
@@ -1802,6 +1892,7 @@ static void OnFrame()
     g_stats.frames++; g_stats.frameMs += ms; if (ms > g_stats.worstMs) g_stats.worstMs = ms;
     g_stats.creates += creates; g_stats.mb += by / 1048576.0;
     g_stats.createMs += Ms(ct); g_stats.waitMs += Ms(wt);
+    g_stats.psos += psos; g_stats.psoMs += psoMs; if (psoLongest > g_stats.psoLongest) g_stats.psoLongest = psoLongest;
     if (hitch) g_stats.hitches++;
 
     if (g_cfg.logging >= 3 && g_ring)
@@ -1821,9 +1912,11 @@ static void OnFrame()
             p += _snprintf_s(tops + p, sizeof(tops) - p, _TRUNCATE, "%s%s %.1f ms/%ld (wait %.1f)",
                              k ? ", " : "", g_slots[top[k].slot].name, Ms(top[k].ticks), top[k].n, Ms(top[k].wait));
         Log2("HITCH %.1f ms | creates %ld (committed %ld, sub %ld, heap %ld, placed %ld, reserved %ld, residency %ld) %.1f MB"
-            " | thread-ms in creates %.1f (residency wait %.1f) | other KMT waits %.1f | fix %s | top: %s",
+            " | thread-ms in creates %.1f (residency wait %.1f) | other KMT waits %.1f | pipelines %ld %.1f ms (longest %.1f)"
+            " | fix %s | top: %s | ends at %.1f ms",
             ms, creates, cnt[C_COMMITTED], cnt[C_SUB], cnt[C_HEAP], cnt[C_PLACED], cnt[C_RESERVED], cnt[C_RESIDENCY],
-            by / 1048576.0, Ms(ct), Ms(wt), Ms(ot), g_sub.on ? "on" : "off", tops[0] ? tops : "-");
+            by / 1048576.0, Ms(ct), Ms(wt), Ms(ot), psos, psoMs, psoLongest, g_sub.on ? "on" : "off", tops[0] ? tops : "-",
+            Ms(now - g_qpc0));
     }
 
     if (Ms(now - g_stats.windowStart) >= 30000.0)
@@ -1831,10 +1924,13 @@ static void OnFrame()
         char vram[160];
         VramText(vram, sizeof(vram));
         Log2("STATS %.0f s: %ld frames, avg %.2f ms, worst %.1f ms, hitches %ld | creates %ld (%.1f/frame) %.1f MB"
-            " | thread-ms in creates %.1f (residency wait %.1f) | %s",
+            " | thread-ms in creates %.1f (residency wait %.1f) | pipelines %ld %.1f ms (longest %.1f)"
+            " | command allocators made: direct %ld, compute %ld, copy %ld | %s",
             Ms(now - g_stats.windowStart) / 1000.0, g_stats.frames, g_stats.frameMs / (g_stats.frames ? g_stats.frames : 1),
             g_stats.worstMs, g_stats.hitches, g_stats.creates,
-            g_stats.creates / (double)(g_stats.frames ? g_stats.frames : 1), g_stats.mb, g_stats.createMs, g_stats.waitMs, vram);
+            g_stats.creates / (double)(g_stats.frames ? g_stats.frames : 1), g_stats.mb, g_stats.createMs, g_stats.waitMs,
+            g_stats.psos, g_stats.psoMs, g_stats.psoLongest, g_pso.allocators[D3D12_COMMAND_LIST_TYPE_DIRECT],
+            g_pso.allocators[D3D12_COMMAND_LIST_TYPE_COMPUTE], g_pso.allocators[D3D12_COMMAND_LIST_TYPE_COPY], vram);
         if (g_sub.tierOk)
         {
             char sum[256];
@@ -1906,9 +2002,24 @@ static void LimitFrame()
 }
 
 static void CrashSeen(HRESULT presentHr);   // the crash file, below
+// The size of the picture the game presents (the output resolution: an
+// upscaler renders below it), logged at the start and whenever it changes.
+// Checked every 120 frames; GetDesc is a read of the swap chain's own state.
+static void NoteDisplay(IDXGISwapChain* sc)
+{
+    static UINT frames = 0, w = 0, h = 0;
+    if (frames++ % 120) return;
+    DXGI_SWAP_CHAIN_DESC d = {};
+    if (FAILED(sc->GetDesc(&d)) || (d.BufferDesc.Width == w && d.BufferDesc.Height == h)) return;
+    w = d.BufferDesc.Width; h = d.BufferDesc.Height;
+    BOOL full = FALSE;
+    sc->GetFullscreenState(&full, NULL);
+    Log("display: %ux%u, %s", w, h, full ? "exclusive fullscreen" : "windowed or borderless");
+}
+
 static HRESULT STDMETHODCALLTYPE h_Present(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
-    if (!t_inPresent++ && !(flags & DXGI_PRESENT_TEST)) OnFrame();
+    if (!t_inPresent++ && !(flags & DXGI_PRESENT_TEST)) { OnFrame(); NoteDisplay(sc); }
     HRESULT hr = o_Present(sc, sync, flags);
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG) CrashSeen(hr);
     if (t_inPresent == 1 && !(flags & DXGI_PRESENT_TEST)) LimitFrame();
@@ -1917,7 +2028,7 @@ static HRESULT STDMETHODCALLTYPE h_Present(IDXGISwapChain* sc, UINT sync, UINT f
 }
 static HRESULT STDMETHODCALLTYPE h_Present1(IDXGISwapChain1* sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp)
 {
-    if (!t_inPresent++ && !(flags & DXGI_PRESENT_TEST)) OnFrame();
+    if (!t_inPresent++ && !(flags & DXGI_PRESENT_TEST)) { OnFrame(); NoteDisplay(sc); }
     HRESULT hr = o_Present1(sc, sync, flags, pp);
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG) CrashSeen(hr);
     if (t_inPresent == 1 && !(flags & DXGI_PRESENT_TEST)) LimitFrame();
@@ -3034,6 +3145,11 @@ static void PatchDevice(ID3D12Device* dev, const char* how)
         { VT_CreateCommittedResource3, (void*)h_CCR3, (void**)&o_CCR3, 10, "CreateCommittedResource3" },
         { VT_CreatePlacedResource2,    (void*)h_CPR2, (void**)&o_CPR2, 10, "CreatePlacedResource2" },
         { VT_CreateReservedResource2,  (void*)h_CRR2, (void**)&o_CRR2, 10, "CreateReservedResource2" },
+        { VT_CreateGraphicsPipelineState, (void*)h_CGPS, (void**)&o_CGPS, 0, "CreateGraphicsPipelineState" },
+        { VT_CreateComputePipelineState,  (void*)h_CCPS, (void**)&o_CCPS, 0, "CreateComputePipelineState" },
+        { VT_CreatePipelineLibrary,    (void*)h_CPL,  (void**)&o_CPL,  3,  "CreatePipelineLibrary" },
+        { VT_CreatePipelineState,      (void*)h_CPS,  (void**)&o_CPS,  3,  "CreatePipelineState" },
+        { VT_CreateCommandAllocator,   (void*)h_CCA,  (void**)&o_CCA,  0,  "CreateCommandAllocator" },
     };
     char okList[1024] = {}, skipList[512] = {};
     for (auto& s : slots)
@@ -3187,6 +3303,9 @@ static WORD KeyVk(const char* k)
     }
     if (!k[1] && ((k[0] >= 'A' && k[0] <= 'Z') || (k[0] >= '0' && k[0] <= '9'))) return (WORD)k[0];
     if (!k[1] && k[0] >= 'a' && k[0] <= 'z') return (WORD)(k[0] - 32);
+    // the mouse's side buttons: Mouse4 = back (XBUTTON1), Mouse5 = forward (XBUTTON2)
+    if (_stricmp(k, "Mouse4") == 0) return VK_XBUTTON1;
+    if (_stricmp(k, "Mouse5") == 0) return VK_XBUTTON2;
     return 0;
 }
 static bool GameHasFocus()
@@ -3431,12 +3550,55 @@ static void WriteMark(int n, const SYSTEMTIME& st)
 // The mark key (Logging 2 and 3: a beep, the marks file and the log's MARK
 // line; also a capture at Logging 3) and the fix's toggle key (any level).
 // Both are looked up again each poll, so a live reload changes them.
+// The frames around a mark (3 s before the press, 1 s after), written a second
+// after the press: the median frame and every frame at least 1.3x it, timed
+// from the press. That shows the stutter the player felt - how long, how long
+// before the press, one frame or several - whatever HitchMs is, and at any
+// frame rate. From the crash report's record of recent frames.
+static const double MARK_BEFORE_MS = 3000.0, MARK_AFTER_MS = 1000.0;
+static const int    MARK_LISTED = 60;   // slow frames listed at most
+
+static void LogMarkFrames(int mark, LONGLONG press)
+{
+    static float ms[CrashState::RECENT], sorted[CrashState::RECENT];
+    static double rel[CrashState::RECENT];
+    LONG n = g_crash.n, have = n < CrashState::RECENT ? n : CrashState::RECENT, count = 0;
+    for (LONG k = 0; k < have; ++k)
+    {
+        LONG i = (n - have + k) % CrashState::RECENT;
+        double t = Ms(g_crash.at[i] - press);
+        if (t < -MARK_BEFORE_MS || t > MARK_AFTER_MS) continue;
+        ms[count] = g_crash.ms[i]; rel[count] = t; sorted[count] = g_crash.ms[i]; ++count;
+    }
+    if (!count) { Log2("MARK %d frames: none recorded around it (the game wasn't drawing)", mark); return; }
+    std::nth_element(sorted, sorted + count / 2, sorted + count);
+    double median = sorted[count / 2], cut = median * 1.3;
+    char list[2048]; int p = 0, listed = 0, slow = 0; list[0] = 0;
+    for (LONG k = 0; k < count; ++k)
+    {
+        if (ms[k] < cut) continue;
+        if (++slow > MARK_LISTED) continue;
+        p += _snprintf_s(list + p, sizeof(list) - p, _TRUNCATE, "%s%+.2f s %.1f ms", listed++ ? ", " : "", rel[k] / 1000.0, ms[k]);
+    }
+    if (slow > MARK_LISTED) _snprintf_s(list + p, sizeof(list) - p, _TRUNCATE, " (and %d more)", slow - MARK_LISTED);
+    Log2("MARK %d frames | %.0f s before to %.0f s after: %ld frames, median %.1f ms | slow frames (1.3x the median or more, timed from the press): %s",
+         mark, MARK_BEFORE_MS / 1000.0, MARK_AFTER_MS / 1000.0, count, median, slow ? list : "none");
+}
+
 static DWORD WINAPI KeyThread(LPVOID)
 {
     bool was = false, tWas = false;
+    struct Pending { int mark; LONGLONG press; } pending[16];
+    int pendingCount = 0;
     for (;;)
     {
         Sleep(30);
+        for (int k = 0; k < pendingCount; )
+        {
+            if (Ms(Now() - pending[k].press) < MARK_AFTER_MS) { ++k; continue; }
+            LogMarkFrames(pending[k].mark, pending[k].press);
+            pending[k] = pending[--pendingCount];
+        }
         WORD vk = g_cfg.logging >= 2 ? KeyVk(g_cfg.captureKey) : 0;
         WORD tk = KeyVk(g_cfg.toggleKey);
         bool tDown = tk && (GetAsyncKeyState(tk) & 0x8000) != 0;
@@ -3472,8 +3634,10 @@ static DWORD WINAPI KeyThread(LPVOID)
             static int marks = 0;
             SYSTEMTIME st;
             GetLocalTime(&st);
+            LONGLONG press = Now();
             Log2("MARK %d by the player at %02d:%02d:%02d (%.0f ms)", ++marks, st.wHour, st.wMinute, st.wSecond,
-                Ms(Now() - g_qpc0));
+                Ms(press - g_qpc0));
+            if (pendingCount < 16) pending[pendingCount++] = { marks, press };
             WriteMark(marks, st);
             PlayChime(CHIME_MARK);
             if (g_cfg.logging >= 3 && g_ring && InterlockedCompareExchange(&g_captureBusy, 1, 0) == 0)
@@ -3689,7 +3853,29 @@ static DWORD WINAPI InitThread(LPVOID)
         GetModuleFileNameA(NULL, exe, MAX_PATH);
         WIN32_FILE_ATTRIBUTE_DATA fa = {};
         GetFileAttributesExA(exe, GetFileExInfoStandard, &fa);
-        Log("game: %s (%llu bytes)", exe, ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
+        unsigned long long size = ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+        // Each store's exe has its own size; one that matches neither is a game update or a changed exe
+        const char* build = size == 423070256ull ? "the Steam build"
+                          : size == 399984176ull ? "the EA App build"
+                          : "not a known Steam or EA App build";
+        Log("game: %s (%llu bytes, %s)", exe, size, build);
+    }
+    {
+        char cpu[96] = "CPU n/a";
+        DWORD n = sizeof(cpu);
+        RegGetValueA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString",
+                     RRF_RT_REG_SZ, NULL, cpu, &n);
+        for (char* c = cpu + strlen(cpu); c > cpu && c[-1] == ' '; ) *--c = 0;   // some CPUs pad the name
+        char win[32] = "?", ver[32] = "";
+        n = sizeof(win); RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "CurrentBuild", RRF_RT_REG_SZ, NULL, win, &n);
+        n = sizeof(ver); RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "DisplayVersion", RRF_RT_REG_SZ, NULL, ver, &n);
+        MEMORYSTATUSEX ms = { sizeof(ms) };
+        GlobalMemoryStatusEx(&ms);
+        SYSTEM_INFO si = {};
+        GetNativeSystemInfo(&si);
+        Log("SYSTEM: %s, %lu threads | %.1f GB RAM (%.1f GB free) | Windows build %s%s%s",
+            cpu, si.dwNumberOfProcessors, ms.ullTotalPhys / 1073741824.0, ms.ullAvailPhys / 1073741824.0,
+            win, ver[0] ? ", " : "", ver);
     }
     {
         // The ASI loader's names this game loads at startup. The mod ships as dinput8.dll since 0.3.10
