@@ -791,6 +791,8 @@ static UINT64 ResourceBytes(ID3D12Device* d, const D3D12_RESOURCE_DESC* rd)
     return ai.SizeInBytes == UINT64_MAX ? 0 : ai.SizeInBytes;
 }
 
+static void CrashSeen(HRESULT presentHr);   // the crash file, below
+
 // The cost is taken before anything here runs: sizing and recording are
 // outside the timed window.
 static void Finish(const CallScope& s, Kind k, HRESULT hr, UINT64 bytes,
@@ -800,6 +802,7 @@ static void Finish(const CallScope& s, Kind k, HRESULT hr, UINT64 bytes,
     LONGLONG t1 = Now();
     LONGLONG dur = t1 - s.t0, wait = t_waitTicks - s.w0;
     --t_inCreate;
+    if (hr == DXGI_ERROR_DEVICE_REMOVED) CrashSeen(hr);   // the report now: a program can quit on this before the watcher looks
 
     Cat c = CatOf(k);
     InterlockedIncrement(&g_frame.count[c]);
@@ -2001,7 +2004,6 @@ static void LimitFrame()
     g_lim.last = (g_lim.last && now - due < period) ? due : Now();
 }
 
-static void CrashSeen(HRESULT presentHr);   // the crash file, below
 // The size of the picture the game presents (the output resolution: an
 // upscaler renders below it), logged at the start and whenever it changes.
 // Checked every 120 frames; GetDesc is a read of the swap chain's own state.
