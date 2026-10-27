@@ -62,12 +62,14 @@
 #include <math.h>
 #include <algorithm>
 #include <mmsystem.h>
+#include <shlobj.h>
 #include "third_party/minhook/include/MinHook.h"
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "version.lib")
 #pragma comment(lib, "advapi32.lib")   // RegGetValue, for the SYSTEM line
 #pragma comment(lib, "winmm.lib")   // PlaySound, for the toggle chime
+#pragma comment(lib, "shell32.lib")   // SHGetFolderPath, for the pool test's desktop folder
 
 // The version only changes when a version is released. Which build this is
 // - the commit it was built from, uncommitted changes, when - comes from
@@ -130,6 +132,52 @@ struct Config
     int  nEngine = 0;
 };
 static Config g_cfg;
+
+// The pool test (see PoolTestStart): the variants, one per launch, and this launch's.
+struct PoolVariant
+{
+    const char* name;
+    bool debugLayer;      // D3D12's debug layer on, its messages in the log (needs Windows' Graphics Tools)
+    bool def, host;       // the GPU pool (DEFAULT); the CPU-visible ones (UPLOAD, READBACK)
+    int  kinds;           // into the GPU pool: 1 buffers, 2 textures, 3 both
+    bool noUav;           // no buffers the GPU writes itself (UAV) in the GPU pool
+    int  heapOnly;        // the GPU pool's heaps flagged for one kind: 1 buffers, 2 textures (0: both, as released)
+    bool skipResidency;   // the game's MakeResident / Evict calls leave pooled resources out
+    bool zeroed;          // heaps made without CREATE_NOT_ZEROED
+    bool smallBlocks;     // 16 MB blocks (4 MB CPU-visible) instead of 128 / 32
+    int  maxKB;           // the biggest resource pooled (0: as released, 16 MB)
+    bool noPrewarm;       // no blocks made when the device appears: only once the game asks
+    bool noGrower;        // no blocks made ahead of need: only when a pool runs dry
+};
+static const PoolVariant POOL_VARIANTS[] = {
+    //  name                                     debug  def    host   kinds noUav  only resid  zeroed small  maxKB prewarm grower
+    { "the pools as released, with the debug layer", true,  true,  true,  3, false, 0, false, false, false, 0,   false, false },
+    { "the pools as released",                   false, true,  true,  3, false, 0, false, false, false, 0,   false, false },
+    { "GPU pool only",                           false, true,  false, 3, false, 0, false, false, false, 0,   false, false },
+    { "CPU-visible pools only",                  false, false, true,  3, false, 0, false, false, false, 0,   false, false },
+    { "GPU pool, buffers only",                  false, true,  false, 1, false, 0, false, false, false, 0,   false, false },
+    { "GPU pool, textures only",                 false, true,  false, 2, false, 0, false, false, false, 0,   false, false },
+    { "no GPU-written buffers",                  false, true,  true,  3, true,  0, false, false, false, 0,   false, false },
+    { "GPU pool, buffers in buffer-only heaps",  false, true,  false, 1, false, 1, false, false, false, 0,   false, false },
+    { "GPU pool, textures in texture-only heaps", false, true, false, 2, false, 2, false, false, false, 0,   false, false },
+    { "residency calls skip pooled resources",   false, true,  true,  3, false, 0, true,  false, false, 0,   false, false },
+    { "heaps zeroed",                            false, true,  true,  3, false, 0, false, true,  false, 0,   false, false },
+    { "small blocks",                            false, true,  true,  3, false, 0, false, false, true,  0,   false, false },
+    { "small resources only (256 KB)",           false, true,  true,  3, false, 0, false, false, false, 256, false, false },
+    { "no blocks made at startup",               false, true,  true,  3, false, 0, false, false, false, 0,   true,  false },
+    { "no blocks made ahead of need",            false, true,  true,  3, false, 0, false, false, false, 0,   false, true  },
+};
+static const int POOL_TEST_COUNT = sizeof(POOL_VARIANTS) / sizeof(POOL_VARIANTS[0]);
+struct PoolTest
+{
+    int                n = 0, tries = 0;   // this launch's test (1-based) and its attempt
+    const PoolVariant* v = NULL;           // null: no test this launch
+    char               state[MAX_PATH] = {}, out[MAX_PATH] = {};   // the state file; the desktop folder (with its slash)
+    volatile LONG      ended = 0, residencyPooled = 0;
+};
+static PoolTest g_pt;
+static void PoolTestStart(const char* gameDir);
+static DWORD WINAPI PoolTestTimer(LPVOID);
 
 // Test builds (build.bat test, TEST_BUILD) go to playtesters: the ini is five
 // keys with neutral names in one [Settings] section (everything else keeps
@@ -421,6 +469,13 @@ static void ReadConfig(Config& c, const Config& fb)
     if (c.maxFps > 0 && c.maxFps < 20) c.maxFps = 20;
     if (c.maxFps > 2000) c.maxFps = 2000;
     if (c.dataReadMBs && (c.dataReadMBs < 25 || c.dataReadMBs > 8000)) c.dataReadMBs = fb.dataReadMBs;
+    if (g_pt.v)   // the pool test: the pools on whatever the ini says, a full crash report, the variant's block sizes
+    {
+        c.suballocate = 1;
+        c.crashInfo = 3;
+        if (g_pt.v->smallBlocks) { c.blockMB = 16; c.hostBlockMB = 4; }
+        if (g_pt.v->maxKB) c.maxResourceKB = g_pt.v->maxKB;
+    }
 }
 
 static void LoadConfig()
@@ -434,6 +489,7 @@ static void LoadConfig()
     _snprintf_s(g_files.logPath, sizeof(g_files.logPath), _TRUNCATE, "%sishimurapatch.log", dir);
     _snprintf_s(g_files.marksPath, sizeof(g_files.marksPath), _TRUNCATE, "%sishimurapatch_marks.txt", dir);
     GetLocalTime(&g_files.started);
+    PoolTestStart(dir);
 
     if (GetFileAttributesA(g_files.iniPath) == INVALID_FILE_ATTRIBUTES)
     {
@@ -1105,6 +1161,11 @@ static void SubSetupPools()
         // a resource never takes more than half a block, so one never strands most of one
         UINT64 cap = (UINT64)g_cfg.maxResourceKB * 1024;
         p.maxResource = cap < p.blockBytes / 2 ? cap : p.blockBytes / 2;
+        if (g_pt.v && !(i == POOL_DEFAULT ? g_pt.v->def : g_pt.v->host)) p.maxBlocks = p.prewarm = 0;   // takes nothing
+        if (g_pt.v && g_pt.v->zeroed) p.heapFlags &= ~D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+        if (g_pt.v && g_pt.v->noPrewarm) p.prewarm = 0;
+        if (g_pt.v && i == POOL_DEFAULT && g_pt.v->heapOnly)
+            p.heapFlags |= g_pt.v->heapOnly == 1 ? D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS : D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
     }
 }
 
@@ -1434,7 +1495,7 @@ static DWORD WINAPI SubGrowThread(LPVOID)
         for (int i = 0; i < POOL_COUNT; ++i)
         {
             SubPool& p = g_sub.pools[i];
-            while (g_sub.on && g_sub.dev && p.count < p.maxBlocks &&   // dev: not while retired
+            while (g_sub.on && g_sub.dev && p.count < p.maxBlocks && !(g_pt.v && g_pt.v->noGrower) &&   // dev: not while retired
                    p.freePages < (LONG64)(p.blockBytes / SUB_PAGE))
                 if (!SubGrow(p, "ahead of need")) break;
         }
@@ -1491,6 +1552,8 @@ static SubPool* SubEligible(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3
         if ((rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && rd->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
             !g_cfg.subGpuTextures)
             return NULL;
+        if (g_pt.v && !(g_pt.v->kinds & (rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? 1 : 2))) return NULL;
+        if (g_pt.v && g_pt.v->noUav && (rd->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return NULL;
         p = &g_sub.pools[POOL_DEFAULT];
         break;
     case D3D12_HEAP_TYPE_UPLOAD:
@@ -1599,6 +1662,7 @@ static void SubPrewarm(ID3D12Device* dev)
         g_sub.on ? "ON" : "off (ToggleKey switches it)", ms, sum,
         (int)(g_sub.pools[POOL_DEFAULT].maxResource / 1024), (int)(g_sub.pools[POOL_UPLOAD].maxResource / 1024),
         g_cfg.maxPoolMB, g_cfg.maxHostPoolMB);
+    if (g_pt.v && (t = CreateThread(NULL, 0, PoolTestTimer, NULL, 0, NULL))) CloseHandle(t);
 }
 
 static HRESULT STDMETHODCALLTYPE h_CCR(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf,
@@ -1716,17 +1780,48 @@ static HRESULT STDMETHODCALLTYPE h_CRR2(ID3D12Device* d, const D3D12_RESOURCE_DE
     Finish(s, K_RESERVED2, hr, 0, NULL, 0, rd, 0);
     return hr;
 }
+// The pool test: counts the game's residency calls on pooled resources and, in
+// the variant that says so, leaves those out (keep: the list to pass on, n its
+// length; free it after). Pooled = carries our tracker.
+static bool PtPooled(ID3D12Pageable* o)
+{
+    UINT size = 0;
+    return o && SUCCEEDED(o->GetPrivateData(SUB_TRACKER_GUID, &size, NULL));
+}
+static ID3D12Pageable* const* PtResidency(UINT& n, ID3D12Pageable* const* objs, ID3D12Pageable**& keep)
+{
+    keep = NULL;
+    if (!g_pt.v || !objs) return objs;
+    UINT pooled = 0;
+    for (UINT i = 0; i < n; ++i) if (PtPooled(objs[i])) ++pooled;
+    if (!pooled) return objs;
+    InterlockedAdd(&g_pt.residencyPooled, (LONG)pooled);
+    if (!g_pt.v->skipResidency || !(keep = (ID3D12Pageable**)malloc(n * sizeof(*keep)))) return objs;
+    UINT k = 0;
+    for (UINT i = 0; i < n; ++i)
+        if (!PtPooled(objs[i])) keep[k++] = objs[i];
+    n = k;
+    return keep;
+}
 static HRESULT STDMETHODCALLTYPE h_MakeResident(ID3D12Device* d, UINT n, ID3D12Pageable* const* objs)
 {
     CallScope s;
-    HRESULT hr = o_MakeResident(d, n, objs);
+    ID3D12Pageable** keep;
+    UINT n2 = n;
+    ID3D12Pageable* const* use = PtResidency(n2, objs, keep);
+    HRESULT hr = n2 || !n ? o_MakeResident(d, n2, use) : S_OK;
+    free(keep);
     Finish(s, K_MAKERESIDENT, hr, 0, NULL, 0, NULL, n);
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE h_Evict(ID3D12Device* d, UINT n, ID3D12Pageable* const* objs)
 {
     CallScope s;
-    HRESULT hr = o_Evict(d, n, objs);
+    ID3D12Pageable** keep;
+    UINT n2 = n;
+    ID3D12Pageable* const* use = PtResidency(n2, objs, keep);
+    HRESULT hr = n2 || !n ? o_Evict(d, n2, use) : S_OK;
+    free(keep);
     Finish(s, K_EVICT, hr, 0, NULL, 0, NULL, n);
     return hr;
 }
@@ -1734,7 +1829,12 @@ static HRESULT STDMETHODCALLTYPE h_Enqueue(ID3D12Device* d, D3D12_RESIDENCY_FLAG
     ID3D12Pageable* const* objs, ID3D12Fence* fence, UINT64 value)
 {
     CallScope s;
-    HRESULT hr = o_Enqueue(d, f, n, objs, fence, value);
+    ID3D12Pageable** keep;
+    UINT n2 = n;
+    ID3D12Pageable* const* use = PtResidency(n2, objs, keep);
+    // all of them left out: nothing to page in, so the fence is signalled at once
+    HRESULT hr = n2 || !n ? o_Enqueue(d, f, n2, use, fence, value) : fence ? fence->Signal(value) : S_OK;
+    free(keep);
     Finish(s, K_ENQUEUE, hr, 0, NULL, (UINT32)f, NULL, n);
     return hr;
 }
@@ -2716,6 +2816,293 @@ static DWORD WINAPI QueueStatsThread(LPVOID)
 }
 
 // ----------------------------------------------------------------------------
+// The pool test, for players whose game crashes with the pools on (integrated
+// GPUs: ROG Ally, MSI Claw). Turned on by ishimurapatch_test.txt in the game
+// folder: [Test] Name = pools, Next = 1 (the file names the test, so later
+// tests can use it too). Each launch runs the next variant of the
+// pools (POOL_VARIANTS): a GPU crash, or 20 s without one, ends it with a box
+// saying what to do next, and the result, the log and any crash report go to
+// "Ishimura Patch test" on the desktop. A launch that ends without a result
+// (the game closed early) runs its test again, once. After the last test Next
+// is 0 and the mod runs as the ini says. The debug-layer test runs only where
+// Windows' Graphics Tools are installed (D3D12's validation: it names the call
+// that's invalid and why); elsewhere it's skipped without a launch.
+// ----------------------------------------------------------------------------
+static void PtCopy(const char* from, const char* name)
+{
+    char to[MAX_PATH];
+    _snprintf_s(to, sizeof(to), _TRUNCATE, "%s%s", g_pt.out, name);
+    FILE* in = _fsopen(from, "rb", _SH_DENYNO);   // the log is open for writing
+    FILE* out = NULL;
+    if (in && fopen_s(&out, to, "wb") == 0 && out)
+    {
+        char buf[65536];
+        size_t got;
+        while ((got = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, got, out);
+    }
+    if (out) fclose(out);
+    if (in) fclose(in);
+}
+
+// One test's result: a line in results.txt and the state file, the files copied, and on to the next test.
+static void PtRecord(int n, const char* result, const char* crashPath, bool copyLog = true)
+{
+    char line[1200], key[8], name[64];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "Test %d of %d (%s): %s", n, POOL_TEST_COUNT, POOL_VARIANTS[n - 1].name, result);
+    char path[MAX_PATH];
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%sresults.txt", g_pt.out);
+    FILE* f = _fsopen(path, "a", _SH_DENYNO);
+    if (f) { fprintf(f, "%s\n", line); fclose(f); }
+    _snprintf_s(key, sizeof(key), _TRUNCATE, "%d", n);
+    WritePrivateProfileStringA("Results", key, result, g_pt.state);
+    _snprintf_s(name, sizeof(name), _TRUNCATE, "test %d log.txt", n);
+    if (copyLog) PtCopy(g_files.logPath, name);
+    if (crashPath)
+    {
+        _snprintf_s(name, sizeof(name), _TRUNCATE, "test %d crash report.txt", n);
+        PtCopy(crashPath, name);
+    }
+    _snprintf_s(key, sizeof(key), _TRUNCATE, "%d", n < POOL_TEST_COUNT ? n + 1 : 0);
+    WritePrivateProfileStringA("Test", "Next", key, g_pt.state);
+    WritePrivateProfileStringA("Test", "Running", "0", g_pt.state);
+    WritePrivateProfileStringA("Test", "Tries", "0", g_pt.state);
+    Log("POOL TEST: %s", line);
+}
+
+static void PtBox(const char* text)
+{
+    MessageBoxA(NULL, text, "Ishimura Patch test", MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+}
+// After the last test: the folder zipped beside itself with Windows' own tar
+// (in Windows 10 1803 and later), so the tester sends one file. False: no zip.
+static bool PtZip(char* zip, size_t size)
+{
+    char parent[MAX_PATH];
+    strcpy_s(parent, sizeof(parent), g_pt.out);
+    size_t n = strlen(parent);
+    if (n && parent[n - 1] == '\\') parent[n - 1] = 0;
+    char* name = strrchr(parent, '\\');
+    if (!name) return false;
+    *name++ = 0;   // parent: the desktop; name: the folder's
+    _snprintf_s(zip, size, _TRUNCATE, "%s\\%s.zip", parent, name);
+    DeleteFileA(zip);
+    char sys[MAX_PATH], cmd[4 * MAX_PATH];
+    if (!GetSystemDirectoryA(sys, MAX_PATH)) return false;
+    _snprintf_s(cmd, sizeof(cmd), _TRUNCATE, "\"%s\\tar.exe\" -a -c -f \"%s\" -C \"%s\" \"%s\"", sys, zip, parent, name);
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) return false;
+    DWORD waited = WaitForSingleObject(pi.hProcess, 30000), code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    bool ok = waited == WAIT_OBJECT_0 && code == 0 && GetFileAttributesA(zip) != INVALID_FILE_ATTRIBUTES;
+    Log("POOL TEST: results %s", ok ? "zipped" : "NOT zipped (the folder is still there)");
+    return ok;
+}
+
+// The last box's text, once the results are zipped (or not).
+static void PtDoneText(char* text, size_t size)
+{
+    char zip[MAX_PATH];
+    bool zipped = PtZip(zip, sizeof(zip));
+    _snprintf_s(text, size, _TRUNCATE, "That was the last test - thank you!\n\n%s\n\nThe mod is back to your normal settings now.",
+        zipped ? "Everything is in \"Ishimura Patch test.zip\" on your desktop. Please send that file."
+               : "Everything is in the \"Ishimura Patch test\" folder on your desktop. Please send that folder "
+                 "(right-click it > Send to > Compressed (zipped) folder, and send the zip).");
+}
+static DWORD WINAPI PtDoneBox(LPVOID)
+{
+    char text[768];
+    PtDoneText(text, sizeof(text));
+    PtBox(text);
+    return 0;
+}
+
+// The debug-layer test: D3D12's validation, switched on before the game makes
+// its device. Its errors and warnings go to the log every 100 ms and before a
+// crash report, each kind of message 5 times at most (one bad call a frame
+// would bury the rest). results.txt gets the first error about heaps or placed
+// resources - the pools' side - and the first error of any kind.
+struct PtDebug
+{
+    SRWLOCK          lock = SRWLOCK_INIT;
+    ID3D12InfoQueue* q = NULL;
+    bool             on = false;
+    volatile LONG    errors = 0, warnings = 0;
+    char             first[200] = "", firstPool[200] = "";   // for results.txt
+    struct { D3D12_MESSAGE_ID id; int n; } seen[256] = {};    // lines logged per kind of message
+};
+static PtDebug g_ptd;
+
+static bool PtGraphicsTools()
+{
+    char path[MAX_PATH];
+    UINT n = GetSystemDirectoryA(path, MAX_PATH);
+    if (!n || n >= MAX_PATH - 24) return false;
+    strcat_s(path, sizeof(path), "\\d3d12SDKLayers.dll");
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+static void PtEnableDebugLayer()
+{
+    typedef HRESULT (WINAPI* PFN_DEBUG)(REFIID, void**);
+    PFN_DEBUG getDebug = (PFN_DEBUG)GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12GetDebugInterface");
+    ID3D12Debug* d = NULL;
+    if (getDebug && SUCCEEDED(getDebug(IID_PPV_ARGS(&d))) && d)
+    {
+        d->EnableDebugLayer();
+        d->Release();
+        g_ptd.on = true;
+        Log("POOL TEST: D3D12 debug layer on");
+    }
+    else Log("POOL TEST: the D3D12 debug layer could not be switched on");
+}
+
+static void PtDrain()
+{
+    AcquireSRWLockExclusive(&g_ptd.lock);
+    if (ID3D12InfoQueue* q = g_ptd.q)
+    {
+        UINT64 n = q->GetNumStoredMessages();
+        for (UINT64 i = 0; i < n; ++i)
+        {
+            SIZE_T len = 0;
+            if (FAILED(q->GetMessage(i, NULL, &len)) || !len) continue;
+            D3D12_MESSAGE* m = (D3D12_MESSAGE*)malloc(len);
+            if (m && SUCCEEDED(q->GetMessage(i, m, &len)))
+            {
+                bool err = m->Severity <= D3D12_MESSAGE_SEVERITY_ERROR, warn = m->Severity == D3D12_MESSAGE_SEVERITY_WARNING;
+                if (err) InterlockedIncrement(&g_ptd.errors); else if (warn) InterlockedIncrement(&g_ptd.warnings);
+                if (err && !g_ptd.first[0]) strncpy_s(g_ptd.first, sizeof(g_ptd.first), m->pDescription, _TRUNCATE);
+                if (err && !g_ptd.firstPool[0] && (strstr(m->pDescription, "Heap") || strstr(m->pDescription, "Placed") ||
+                                                   strstr(m->pDescription, "Ishimura")))
+                    strncpy_s(g_ptd.firstPool, sizeof(g_ptd.firstPool), m->pDescription, _TRUNCATE);
+                int k = 0;
+                while (k < 256 && g_ptd.seen[k].n && g_ptd.seen[k].id != m->ID) ++k;
+                bool show = k == 256 || g_ptd.seen[k].n < 5;
+                if (k < 256) { g_ptd.seen[k].id = m->ID; ++g_ptd.seen[k].n; }
+                if ((err || warn) && show)
+                    Log("DEBUG LAYER %s (id %d): %s", m->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION ? "CORRUPTION" : err ? "ERROR" : "warning",
+                        (int)m->ID, m->pDescription);
+            }
+            free(m);
+        }
+        q->ClearStoredMessages();
+    }
+    ReleaseSRWLockExclusive(&g_ptd.lock);
+}
+static DWORD WINAPI PtDebugThread(LPVOID)
+{
+    for (;;) { PtDrain(); Sleep(100); }
+}
+
+// The box after a test: what happened and what's next. OK closes the game
+// (at the menu, or already crashed: nothing to lose), so the tester only
+// relaunches. Everything is on disk by now; the log is flushed per line.
+static void PtNextBox(const char* what)
+{
+    char text[768];
+    if (g_pt.n == POOL_TEST_COUNT)
+    {
+        PtDoneText(text, sizeof(text) - 40);
+        strcat_s(text, sizeof(text), "\n\nPress OK to close the game.");
+    }
+    else
+        _snprintf_s(text, sizeof(text), _TRUNCATE, "Test %d of %d is done%s.\n\nPress OK to close the game, then launch it again for test %d.",
+            g_pt.n, POOL_TEST_COUNT, what, g_pt.n + 1);
+    PtBox(text);
+    Log("POOL TEST: closing the game (the tester pressed OK)");
+    TerminateProcess(GetCurrentProcess(), 0);
+}
+
+// At launch (LoadConfig, before the ini is read): is a test on, and which one?
+static void PoolTestStart(const char* gameDir)
+{
+    _snprintf_s(g_pt.state, sizeof(g_pt.state), _TRUNCATE, "%sishimurapatch_test.txt", gameDir);
+    char name[32];
+    GetPrivateProfileStringA("Test", "Name", "", name, sizeof(name), g_pt.state);
+    int next = GetPrivateProfileIntA("Test", "Next", 0, g_pt.state);
+    if (_stricmp(name, "pools") != 0 || next < 1 || next > POOL_TEST_COUNT) return;
+    char desk[MAX_PATH];   // where the folder goes: the desktop, or [Test] Folder (for trying the test out)
+    GetPrivateProfileStringA("Test", "Folder", "", desk, sizeof(desk), g_pt.state);
+    if (!desk[0] && FAILED(SHGetFolderPathA(NULL, CSIDL_DESKTOPDIRECTORY, NULL, 0, desk))) strcpy_s(desk, sizeof(desk), gameDir);
+    _snprintf_s(g_pt.out, sizeof(g_pt.out), _TRUNCATE, "%s\\Ishimura Patch test\\", desk);
+    SHCreateDirectoryExA(NULL, g_pt.out, NULL);
+    int running = GetPrivateProfileIntA("Test", "Running", 0, g_pt.state);
+    int tries = running == next ? GetPrivateProfileIntA("Test", "Tries", 0, g_pt.state) : 0;
+    bool tools = PtGraphicsTools();
+    for (;;)   // past a test that ended twice without a result, or one this PC can't run
+    {
+        if (tries >= 2)
+            PtRecord(next, "no result, twice (the game closed before the test ended: closed early, or a crash the mod didn't catch)", NULL);
+        else if (POOL_VARIANTS[next - 1].debugLayer && !tools)
+            PtRecord(next, "skipped (Windows' Graphics Tools aren't installed)", NULL, false);
+        else break;
+        tries = 0;
+        if (++next > POOL_TEST_COUNT)
+        {
+            HANDLE t = CreateThread(NULL, 0, PtDoneBox, NULL, 0, NULL);
+            if (t) CloseHandle(t);
+            return;
+        }
+    }
+    char v[8];
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", next);
+    WritePrivateProfileStringA("Test", "Running", v, g_pt.state);
+    _snprintf_s(v, sizeof(v), _TRUNCATE, "%d", tries + 1);
+    WritePrivateProfileStringA("Test", "Tries", v, g_pt.state);
+    g_pt.n = next;
+    g_pt.tries = tries + 1;
+    g_pt.v = &POOL_VARIANTS[next - 1];
+}
+
+// The end of this launch's test: a GPU crash (crashName set), or the timer.
+static void PoolTestEnd(const char* crashName, HRESULT reason, const char* crashPath)
+{
+    if (!g_pt.v || InterlockedCompareExchange(&g_pt.ended, 1, 0) != 0) return;
+    char result[1024];
+    double upS = Ms(Now() - g_qpc0) / 1000.0;
+    if (crashName)
+        _snprintf_s(result, sizeof(result), _TRUNCATE, "CRASHED %.0f s in (%s 0x%08lX)", upS, crashName, (unsigned long)reason);
+    else
+        _snprintf_s(result, sizeof(result), _TRUNCATE, "no crash in %.0f s", upS);
+    _snprintf_s(result + strlen(result), sizeof(result) - strlen(result), _TRUNCATE,
+        " | %ld resources pooled, %ld fell back | %ld residency calls on pooled resources",
+        g_sub.made, g_sub.fellBack, g_pt.residencyPooled);
+    if (g_ptd.on)
+    {
+        PtDrain();
+        _snprintf_s(result + strlen(result), sizeof(result) - strlen(result), _TRUNCATE,
+            " | debug layer: %ld errors, %ld warnings%s%s%s%s", g_ptd.errors, g_ptd.warnings,
+            g_ptd.firstPool[0] ? "; first about heaps: " : "", g_ptd.firstPool, g_ptd.first[0] ? "; first: " : "", g_ptd.first);
+    }
+    PtRecord(g_pt.n, result, crashPath);
+    // a crash: the game waits for the OK, so it can't quit under the box
+    PtNextBox(crashName ? " (the game crashed - some tests are meant to)" : " (no crash)");
+}
+
+// The game couldn't make its device with the debug layer on (it can't be
+// switched off again): this test can't run here.
+static void PoolTestDebugFailed(HRESULT hr)
+{
+    if (!g_pt.v || InterlockedCompareExchange(&g_pt.ended, 1, 0) != 0) return;
+    char result[128];
+    _snprintf_s(result, sizeof(result), _TRUNCATE, "couldn't run: the game's device failed with the debug layer on (0x%08lX)", (unsigned long)hr);
+    PtRecord(g_pt.n, result, NULL);
+    PtNextBox(" (it couldn't run on this PC - that's fine)");
+}
+
+// No crash in the 20 s since the device was set up (the handhelds crash about
+// 8 s after launch): this test passes.
+static DWORD WINAPI PoolTestTimer(LPVOID)
+{
+    Sleep(20000);
+    PoolTestEnd(NULL, S_OK, NULL);
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
 // Crash info ([Advanced] CrashInfo). Windows' DRED is switched on just before
 // the game makes its device (CrashInfo 2: for a bad memory access, the address
 // and what was allocated there; 3: also the GPU work in flight). At 1 there is
@@ -2841,6 +3228,7 @@ static void CrashKeepNewest(const char* newest, int keep)
 static void WriteCrashFile(HRESULT reason, const char* seenBy)
 {
     if (InterlockedCompareExchange(&g_crash.written, 1, 0) != 0) return;
+    if (g_ptd.on) PtDrain();   // the debug layer's last words into the log, for the report's end of the log
     SYSTEMTIME st; GetLocalTime(&st);
     char path[MAX_PATH];
     strncpy_s(path, sizeof(path), g_files.logPath, _TRUNCATE);
@@ -2964,6 +3352,7 @@ static void WriteCrashFile(HRESULT reason, const char* seenBy)
     fclose(f);
     Log("CRASH: the GPU device was removed (%s, 0x%08lX) - details saved to %s", name, (unsigned long)reason, path);
     CrashKeepNewest(path, 10);
+    PoolTestEnd(name, reason, path);
 }
 
 // Polls the device every 50 ms (one cheap call), for a removal the game reports
@@ -3123,6 +3512,19 @@ static void PatchDevice(ID3D12Device* dev, const char* how)
         HANDLE ct = CreateThread(NULL, 0, CrashWatchThread, NULL, 0, NULL);
         if (ct) CloseHandle(ct);
     }
+    if (g_ptd.on)
+    {
+        ID3D12InfoQueue* q = NULL;
+        if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&q))) && q)
+        {
+            AcquireSRWLockExclusive(&g_ptd.lock);
+            g_ptd.q = q;   // kept: the device lives as long as the game
+            ReleaseSRWLockExclusive(&g_ptd.lock);
+            HANDLE dt = CreateThread(NULL, 0, PtDebugThread, NULL, 0, NULL);
+            if (dt) CloseHandle(dt);
+        }
+        else Log("POOL TEST: the debug layer's message queue isn't there - no messages this session");
+    }
 #ifdef CRASH_TEST
     dev->AddRef();
     { HANDLE tt = CreateThread(NULL, 0, CrashTestThread, dev, 0, NULL); if (tt) CloseHandle(tt); }
@@ -3175,8 +3577,13 @@ static void PatchDevice(ID3D12Device* dev, const char* how)
 
 static HRESULT WINAPI h_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REFIID riid, void** pp)
 {
-    if (!g_devicePatched) EnableDred();   // before the device: DRED settings apply to devices made after them
+    if (!g_devicePatched)
+    {
+        EnableDred();   // before the device: DRED settings apply to devices made after them
+        if (g_pt.v && g_pt.v->debugLayer && !g_ptd.on) PtEnableDebugLayer();
+    }
     HRESULT hr = o_D3D12CreateDevice(adapter, fl, riid, pp);
+    if (FAILED(hr) && pp && g_ptd.on && !g_devicePatched) PoolTestDebugFailed(hr);
     if (SUCCEEDED(hr) && pp && *pp && !g_devicePatched)
     {
         ID3D12Device* dev = NULL;
@@ -3900,6 +4307,8 @@ static DWORD WINAPI InitThread(LPVOID)
         else
             Log("loader: %s", n ? found : "none of dinput8.dll, winmm.dll, version.dll in the game folder");
     }
+    if (g_pt.v)
+        Log("POOL TEST: test %d of %d - %s (try %d) | results to %s", g_pt.n, POOL_TEST_COUNT, g_pt.v->name, g_pt.tries, g_pt.out);
     Log("clock: QPC frequency %lld, qpc0 %lld (stamps are ms since qpc0; PresentMon's TimeInQPC is the same clock)",
         g_qpcFreq, g_qpc0);
 
