@@ -85,7 +85,7 @@ static const char* BUILD_STAMP = BUILD_ID ", " __DATE__ " " __TIME__;
 extern "C" {
 extern const int VT_GetResourceAllocationInfo, VT_CreateCommittedResource, VT_CreateHeap,
     VT_CreatePlacedResource, VT_CreateReservedResource, VT_MakeResident, VT_Evict, VT_GetDeviceRemovedReason,
-    VT_EnqueueMakeResident, VT_CreateCommittedResource1, VT_CreateHeap1, VT_CreateReservedResource1,
+    VT_EnqueueMakeResident, VT_SetResidencyPriority, VT_CreateCommittedResource1, VT_CreateHeap1, VT_CreateReservedResource1,
     VT_CreateCommittedResource2, VT_CreatePlacedResource1, VT_CreateCommittedResource3,
     VT_CreatePlacedResource2, VT_CreateReservedResource2, VT_Present, VT_Present1,
     VT_CreateCommandQueue, VT_CreateCommandQueue1, VT_Q_ExecuteCommandLists, VT_Q_Signal, VT_Q_Wait,
@@ -128,6 +128,8 @@ struct Config
     int  subGpuTextures   = 0;
     int  raiseCopyQueue = 1;
     int  crashInfo = 1;
+    int  fakeVramMB = 0;   // [Advanced] FakeVramMB: testing - leave the game about this much of the card (FillVram)
+    int  debugLayer = 0;   // [Advanced] DebugLayer: testing - D3D12's debug layer on, its messages in the log
     struct { char cls[96], fld[96], val[64]; } engine[16];   // [Engine] Class.Field = value
     int  nEngine = 0;
 };
@@ -453,6 +455,8 @@ static void ReadConfig(Config& c, const Config& fb)
     c.subGpuTextures   = GetPrivateProfileIntA(INI_ADV, "SuballocateGpuWrittenTextures", fb.subGpuTextures, ini) ? 1 : 0;
     c.raiseCopyQueue   = GetPrivateProfileIntA(INI_FIX, "RaiseCopyQueue", fb.raiseCopyQueue, ini) ? 1 : 0;
     c.crashInfo        = GetPrivateProfileIntA(INI_ADV, "CrashInfo", fb.crashInfo, ini);
+    c.fakeVramMB       = GetPrivateProfileIntA(INI_ADV, "FakeVramMB", fb.fakeVramMB, ini);
+    c.debugLayer       = GetPrivateProfileIntA(INI_ADV, "DebugLayer", fb.debugLayer, ini) ? 1 : 0;
 
     if (c.logging < 0 || c.logging > 3) c.logging = fb.logging;
     if (c.crashInfo < 0 || c.crashInfo > 3) c.crashInfo = fb.crashInfo;
@@ -921,6 +925,7 @@ typedef HRESULT (STDMETHODCALLTYPE* PFN_CRR2)(ID3D12Device*, const D3D12_RESOURC
 typedef HRESULT (STDMETHODCALLTYPE* PFN_RES)(ID3D12Device*, UINT, ID3D12Pageable* const*);
 typedef HRESULT (STDMETHODCALLTYPE* PFN_ENQ)(ID3D12Device*, D3D12_RESIDENCY_FLAGS, UINT,
     ID3D12Pageable* const*, ID3D12Fence*, UINT64);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_SRP)(ID3D12Device*, UINT, ID3D12Pageable* const*, const D3D12_RESIDENCY_PRIORITY*);
 
 static PFN_CCR  o_CCR;  static PFN_CCR1 o_CCR1; static PFN_CCR2 o_CCR2; static PFN_CCR3 o_CCR3;
 static PFN_CH   o_CH;   static PFN_CH1  o_CH1;
@@ -1100,6 +1105,13 @@ struct SubBlock
     UINT64*     bits;        // 1 = page in use
     UINT        pages, freePages;
     bool        retired;     // out of its pool; deleted when its last page is freed
+    // Residency priority (h_SetResidencyPriority): D3D12 sets it per heap, so a block's is the highest any of its
+    // resources has - the game's own value where it set one, NORMAL where it didn't - and it comes back down
+    // as they are lowered or freed. Up to 8 distinct values are counted; a 9th or later counts at its highest.
+    UINT        residents;                    // pooled resources in it
+    struct { UINT prio, count; } prios[8];    // the priorities the game set on residents, and how many each
+    UINT        overflowMax;                  // the highest of any further values, until the block empties
+    UINT        applied;                      // what the heap is set to (0: never set - D3D12's default, NORMAL)
 };
 enum PoolId { POOL_DEFAULT, POOL_UPLOAD, POOL_READBACK, POOL_COUNT };
 struct SubPool
@@ -1131,6 +1143,10 @@ struct SubState
     DeviceQueues   devices[SUB_MAX_DEVICES] = {};
     volatile LONG  live = 0, made = 0, fellBack = 0, heapFails = 0, capped = 0;
     volatile LONG  budgetHeld = 0, givenBack = 0;   // growth held at the memory budget; empty blocks handed back
+    volatile LONG  priorityMoved = 0;               // residency priorities asked for pooled resources, set on their blocks
+    // per STATS window: the priorities the game asked for pooled resources (minimum, low, normal, high, maximum),
+    // for the rest, and how often a block's heap priority changed
+    volatile LONG  prioAsked[5] = {}, prioOthers = 0, prioChanged = 0;
     bool           heldLogged = false;                // "not growing" said once per stretch near the budget
 };
 static SubState g_sub;
@@ -1301,6 +1317,7 @@ static bool SubAllocFrom(SubPool& p, UINT n, SubSlot& out, ID3D12Heap*& heap)
         if (r < 0) continue;
         SubMark(b, (UINT)r, n, true);
         b->freePages -= n;
+        ++b->residents;
         InterlockedAdd64(&p.freePages, -(LONG64)n);
         out.block = b; out.first = (UINT)r; out.pages = n;
         heap = b->heap;
@@ -1324,15 +1341,47 @@ static bool SubAlloc(SubPool& p, UINT64 bytes, SubSlot& out, ID3D12Heap*& heap)
         SetEvent(g_sub.growEvent);   // keep a block's worth free ahead of the next burst
     return ok;
 }
-static void SubFree(const SubSlot& s)
+// Under the lock: count one resident's priority in (d = 1) or out (d = -1); 0 = never set.
+static void SubPrioCount(SubBlock* b, UINT p, int d)
+{
+    if (!p) return;
+    for (auto& e : b->prios)
+        if (e.count && e.prio == p) { e.count += d; return; }
+    if (d < 0) return;   // it was counted at overflowMax: stays there until the block empties
+    for (auto& e : b->prios)
+        if (!e.count) { e.prio = p; e.count = 1; return; }
+    if (p > b->overflowMax) b->overflowMax = p;
+}
+// Under the lock: the priority the block's heap should have.
+static UINT SubPrioWanted(const SubBlock* b)
+{
+    UINT set = 0, top = b->overflowMax;
+    for (const auto& e : b->prios)
+        if (e.count) { set += e.count; if (e.prio > top) top = e.prio; }
+    if (b->residents > set && (UINT)D3D12_RESIDENCY_PRIORITY_NORMAL > top) top = D3D12_RESIDENCY_PRIORITY_NORMAL;
+    return top ? top : (UINT)D3D12_RESIDENCY_PRIORITY_NORMAL;
+}
+static int SubPrioLevel(UINT p)   // 0 minimum .. 4 maximum, for the log
+{
+    return p < D3D12_RESIDENCY_PRIORITY_LOW ? 0 : p < D3D12_RESIDENCY_PRIORITY_NORMAL ? 1 : p < D3D12_RESIDENCY_PRIORITY_HIGH ? 2
+         : p < D3D12_RESIDENCY_PRIORITY_MAXIMUM ? 3 : 4;
+}
+
+static void SubFree(const SubSlot& s, UINT prio = 0)
 {
     SubBlock* b = s.block;
     AcquireSRWLockExclusive(&g_sub.lock);
     SubMark(b, s.first, s.pages, false);
     b->freePages += s.pages;
+    --b->residents;
+    SubPrioCount(b, prio, -1);
+    if (!b->residents) { memset(b->prios, 0, sizeof(b->prios)); b->overflowMax = 0; }
+    // its priority may come down now: the grower thread sets it (no D3D12 call from inside a resource's release)
+    bool lower = b->heap && b->applied && SubPrioWanted(b) != b->applied && g_sub.growEvent;
     bool done = b->retired && b->freePages == b->pages;   // a retired block's last resource is gone
     if (!b->retired) InterlockedAdd64(&b->pool->freePages, s.pages);
     ReleaseSRWLockExclusive(&g_sub.lock);
+    if (lower) SetEvent(g_sub.growEvent);
     if (done) { delete[] b->bits; delete b; }
 }
 
@@ -1484,6 +1533,35 @@ static void SubGiveBack(SubPool& p)
         (unsigned long long)(n * (p.blockBytes >> 20)), off ? "the fix is off" : "near the memory budget", vram);
 }
 
+// Blocks whose wanted priority changed since it was set (resources freed): set
+// now. Only blocks the game has set a priority in are ever touched.
+static PFN_SRP o_SetResidencyPriority;
+static void SubPrioSync()
+{
+    if (!o_SetResidencyPriority) return;
+    ID3D12Pageable* heaps[64];
+    D3D12_RESIDENCY_PRIORITY pr[64];
+    int n = 0;
+    AcquireSRWLockExclusive(&g_sub.lock);
+    ID3D12Device* dev = g_sub.dev;
+    for (SubPool& p : g_sub.pools)
+        for (LONG i = 0; i < p.count && n < 64; ++i)
+        {
+            SubBlock* b = p.blocks[i];
+            UINT want = SubPrioWanted(b);
+            if (!b->heap || !b->applied || want == b->applied) continue;
+            b->applied = want;
+            b->heap->AddRef();
+            heaps[n] = b->heap; pr[n++] = (D3D12_RESIDENCY_PRIORITY)want;
+        }
+    if (dev && n) dev->AddRef();
+    ReleaseSRWLockExclusive(&g_sub.lock);
+    if (!n) return;
+    if (dev) { o_SetResidencyPriority(dev, n, heaps, pr); dev->Release(); }
+    for (int i = 0; i < n; ++i) heaps[i]->Release();
+    InterlockedAdd(&g_sub.prioChanged, n);
+}
+
 static DWORD WINAPI SubGrowThread(LPVOID)
 {
     for (;;)
@@ -1492,6 +1570,7 @@ static DWORD WINAPI SubGrowThread(LPVOID)
         OpenAdapter();
         if (SubBudgetRoom(g_sub.pools[POOL_DEFAULT])) g_sub.heldLogged = false;   // room again: say so next time
         for (int i = 0; i < POOL_COUNT; ++i) SubGiveBack(g_sub.pools[i]);
+        SubPrioSync();
         for (int i = 0; i < POOL_COUNT; ++i)
         {
             SubPool& p = g_sub.pools[i];
@@ -1508,6 +1587,7 @@ struct SubTracker final : IUnknown
 {
     volatile LONG ref = 1;
     SubSlot       slot;
+    UINT          priority = 0;   // the residency priority the game set on the resource (0: never)
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** pp) override
     {
         if (riid == __uuidof(IUnknown)) { *pp = this; AddRef(); return S_OK; }
@@ -1519,7 +1599,7 @@ struct SubTracker final : IUnknown
         LONG r = InterlockedDecrement(&ref);
         if (r == 0)
         {
-            SubFree(slot);
+            SubFree(slot, priority);
             InterlockedDecrement(&g_sub.live);
             delete this;
         }
@@ -1620,6 +1700,53 @@ static bool SubTry(ID3D12Device* d, const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_
     }
     if (!SubAttach(pp, slot)) { InterlockedIncrement(&g_sub.fellBack); return false; }
     return true;
+}
+
+// [Advanced] FakeVramMB (testing): a big card made small, to reproduce the
+// low-memory crash at home. At setup the card is filled with 256 MB heaps
+// until about FakeVramMB of the budget is left for the game, and they are set
+// to the top residency priority, so when the game runs over, Windows moves the
+// game's memory out rather than the filler - as on a small card. Kept until
+// the game closes.
+static void FillVram(ID3D12Device* dev)
+{
+    if (g_cfg.fakeVramMB <= 0) return;
+    OpenAdapter();
+    DXGI_QUERY_VIDEO_MEMORY_INFO m = {};
+    UINT64 leave = (UINT64)g_cfg.fakeVramMB << 20, step = 256ull << 20;
+    if (!MemoryInfo(true, m) || m.Budget <= m.CurrentUsage + leave)
+    {
+        Log("FAKE VRAM: not filled (no budget numbers, or less than %d MB free already)", g_cfg.fakeVramMB);
+        return;
+    }
+    int want = (int)((m.Budget - m.CurrentUsage - leave) / step), made = 0;
+    ID3D12Pageable** heaps = new ID3D12Pageable*[want > 0 ? want : 1];
+    D3D12_HEAP_DESC hd = {};
+    hd.SizeInBytes = step;
+    hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hd.Flags = D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+    for (; made < want; ++made)
+    {
+        ID3D12Heap* h = NULL;
+        if (FAILED(o_CH ? o_CH(dev, &hd, IID_PPV_ARGS(&h)) : dev->CreateHeap(&hd, IID_PPV_ARGS(&h))) || !h) break;
+        h->SetName(L"Ishimura Patch FakeVramMB filler");
+        heaps[made] = h;   // kept: released when the game closes
+    }
+    ID3D12Device1* d1 = NULL;
+    bool top = false;
+    if (made && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d1))))
+    {
+        D3D12_RESIDENCY_PRIORITY* pr = new D3D12_RESIDENCY_PRIORITY[made];
+        for (int i = 0; i < made; ++i) pr[i] = D3D12_RESIDENCY_PRIORITY_MAXIMUM;
+        top = SUCCEEDED(d1->SetResidencyPriority(made, heaps, pr));
+        delete[] pr;
+        d1->Release();
+    }
+    delete[] heaps;
+    char vram[160];
+    VramText(vram, sizeof(vram));
+    Log("FAKE VRAM: filled %d x 256 MB (%d MB)%s - about %d MB left for the game | %s", made, made * 256,
+        top ? " at top residency priority" : " (priority not set)", g_cfg.fakeVramMB, vram);
 }
 
 static void SubPrewarm(ID3D12Device* dev)
@@ -1839,6 +1966,70 @@ static HRESULT STDMETHODCALLTYPE h_Enqueue(ID3D12Device* d, D3D12_RESIDENCY_FLAG
     return hr;
 }
 
+// Residency priority: D3D12 takes it only for heaps and committed resources -
+// for a placed one it's an invalid call and the device is removed. The game
+// sets priorities when the card runs short of memory, on resources it made
+// committed, and the pools made some of them placed: the low-memory crash
+// (DXGI_ERROR_INVALID_CALL on 8 GB cards; found with the D3D12 debug layer,
+// 10-27). So each pooled resource's priority is remembered (its tracker) and
+// its block's heap gets the highest of its residents' (SubPrioWanted), up and
+// back down; the rest pass as asked.
+static HRESULT STDMETHODCALLTYPE h_SetResidencyPriority(ID3D12Device* d, UINT n, ID3D12Pageable* const* objs,
+                                                        const D3D12_RESIDENCY_PRIORITY* pr)
+{
+    if (!objs || !pr || !n) return o_SetResidencyPriority(d, n, objs, pr);
+    UINT pooled = 0;
+    for (UINT i = 0; i < n; ++i) if (PtPooled(objs[i])) ++pooled;
+    InterlockedAdd(&g_sub.prioOthers, (LONG)(n - pooled));
+    if (!pooled) return o_SetResidencyPriority(d, n, objs, pr);
+    ID3D12Pageable** keep = (ID3D12Pageable**)malloc(n * sizeof(*keep));
+    D3D12_RESIDENCY_PRIORITY* keepPr = (D3D12_RESIDENCY_PRIORITY*)malloc(n * sizeof(*keepPr));
+    ID3D12Pageable** heaps = (ID3D12Pageable**)malloc(n * sizeof(*heaps));
+    D3D12_RESIDENCY_PRIORITY* heapPr = (D3D12_RESIDENCY_PRIORITY*)malloc(n * sizeof(*heapPr));
+    if (!keep || !keepPr || !heaps || !heapPr)
+    {
+        free(keep); free(keepPr); free(heaps); free(heapPr);
+        return S_OK;   // nothing to do it with: dropping it beats removing the device
+    }
+    UINT k = 0, h = 0;
+    for (UINT i = 0; i < n; ++i)
+    {
+        IUnknown* u = NULL;
+        UINT size = sizeof(u);
+        if (!objs[i] || FAILED(objs[i]->GetPrivateData(SUB_TRACKER_GUID, &size, &u)) || !u)
+        {
+            keep[k] = objs[i]; keepPr[k++] = pr[i];
+            continue;
+        }
+        SubTracker* t = static_cast<SubTracker*>(u);
+        SubBlock* b = t->slot.block;
+        InterlockedIncrement(&g_sub.prioAsked[SubPrioLevel((UINT)pr[i])]);
+        AcquireSRWLockExclusive(&g_sub.lock);
+        SubPrioCount(b, t->priority, -1);
+        t->priority = (UINT)pr[i];
+        SubPrioCount(b, t->priority, 1);
+        UINT want = SubPrioWanted(b);
+        if (b->heap && want != (b->applied ? b->applied : (UINT)D3D12_RESIDENCY_PRIORITY_NORMAL))
+        {
+            // the same heap twice in one call: the later entry overwrites the earlier (they get the same value)
+            b->applied = want;
+            b->heap->AddRef();   // released below, after the call
+            heaps[h] = b->heap; heapPr[h++] = (D3D12_RESIDENCY_PRIORITY)want;
+        }
+        else if (!b->applied) b->applied = want;   // from now on the block follows its residents
+        ReleaseSRWLockExclusive(&g_sub.lock);
+        u->Release();
+    }
+    HRESULT hr = k ? o_SetResidencyPriority(d, k, keep, keepPr) : S_OK;
+    if (h) o_SetResidencyPriority(d, h, heaps, heapPr);
+    for (UINT i = 0; i < h; ++i) heaps[i]->Release();
+    InterlockedAdd(&g_sub.prioChanged, (LONG)h);
+    if (InterlockedAdd(&g_sub.priorityMoved, (LONG)pooled) == (LONG)pooled)
+        Log2("SUB: the game set residency priorities on pooled resources - their blocks follow them (%u now, %u blocks changed)", pooled, h);
+    free(keep); free(keepPr); free(heaps); free(heapPr);
+    return hr;
+}
+
 // ----------------------------------------------------------------------------
 // The kernel wait (MinHook): D3D12's residency fence wait goes through here
 // ----------------------------------------------------------------------------
@@ -2042,6 +2233,25 @@ static void OnFrame()
                 " | growth held at the memory budget %ld times, %ld empty blocks given back",
                 g_sub.on ? "on" : "off", sum, g_sub.live, g_sub.made, g_sub.fellBack, g_sub.capped, g_sub.heapFails,
                 g_sub.budgetHeld, g_sub.givenBack);
+            LONG asked = 0;
+            for (int i = 0; i < 5; ++i) asked += g_sub.prioAsked[i];
+            if (asked || g_sub.prioOthers || g_sub.prioChanged)
+            {
+                double mb[5] = {};   // the blocks' memory by the priority their heap has now
+                AcquireSRWLockShared(&g_sub.lock);
+                for (const SubPool& p : g_sub.pools)
+                    for (LONG i = 0; i < p.count; ++i)
+                        mb[SubPrioLevel(p.blocks[i]->applied ? p.blocks[i]->applied : (UINT)D3D12_RESIDENCY_PRIORITY_NORMAL)] +=
+                            p.blocks[i]->pages * (double)SUB_PAGE / 1048576.0;
+                ReleaseSRWLockShared(&g_sub.lock);
+                Log2("PRIORITY 30 s: the game set %ld on pooled resources (minimum %ld, low %ld, normal %ld, high %ld, maximum %ld), "
+                     "%ld on others | blocks changed %ld times | blocks now: minimum %.0f MB, low %.0f, normal %.0f, high %.0f, maximum %.0f",
+                     asked, g_sub.prioAsked[0], g_sub.prioAsked[1], g_sub.prioAsked[2], g_sub.prioAsked[3], g_sub.prioAsked[4],
+                     g_sub.prioOthers, g_sub.prioChanged, mb[0], mb[1], mb[2], mb[3], mb[4]);
+                for (int i = 0; i < 5; ++i) InterlockedExchange(&g_sub.prioAsked[i], 0);
+                InterlockedExchange(&g_sub.prioOthers, 0);
+                InterlockedExchange(&g_sub.prioChanged, 0);
+            }
         }
         LONGLONG keepLast = g_stats.last;
         g_stats = Stats();
@@ -2331,6 +2541,7 @@ static DWORD WINAPI PresentHookThread(LPVOID param)
         }
     }
     else Log("setup: Present hook NOT INSTALLED (%s failed) - no frame timing; PresentMon still lines up by QPC", fail);
+    FillVram(dev);
     SubPrewarm(dev);
     if (sc) sc->Release();
     if (fac) fac->Release();
@@ -3251,9 +3462,9 @@ static void WriteCrashFile(HRESULT reason, const char* seenBy)
     char sum[256] = "", vram[160] = "";
     if (g_sub.tierOk) SubSummary(sum, sizeof(sum));
     VramText(vram, sizeof(vram));
-    fprintf(f, "THE MOD\nMemory fix (Suballocate): %s | %s\n%ld live, %ld made, %ld fell back, %ld block failures, growth held at the budget %ld times, %ld empty blocks given back\n%s\n",
+    fprintf(f, "THE MOD\nMemory fix (Suballocate): %s | %s\n%ld live, %ld made, %ld fell back, %ld block failures, growth held at the budget %ld times, %ld empty blocks given back, %ld residency priorities moved to blocks\n%s\n",
             g_sub.on ? "on" : "off", sum[0] ? sum : "no pools", g_sub.live, g_sub.made, g_sub.fellBack, g_sub.heapFails,
-            g_sub.budgetHeld, g_sub.givenBack, vram);
+            g_sub.budgetHeld, g_sub.givenBack, g_sub.priorityMoved, vram);
     fprintf(f, "Logging %d | RaiseCopyQueue %d | Reflex %d | MaxFps %d | engine settings %d | CrashInfo %d (DRED %s)\n\n",
             g_cfg.logging, g_cfg.raiseCopyQueue, g_cfg.reflex, g_cfg.maxFps, g_cfg.nEngine, g_cfg.crashInfo, g_crash.dredOn ? "on" : "off");
 
@@ -3400,7 +3611,39 @@ static DWORD WINAPI CrashTestThread(LPVOID param)
     ID3D12Device* dev = (ID3D12Device*)param;
     Sleep(12000);
     Log("CRASH TEST %d: starting", CRASH_TEST);
-#if CRASH_TEST == 5
+#if CRASH_TEST == 6
+    // residency priority on pooled resources: the block follows its residents, up and back down, with no invalid call
+    {
+        D3D12_HEAP_PROPERTIES hp6 = {}; hp6.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd6 = {}; rd6.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd6.Width = 65536; rd6.Height = 1; rd6.DepthOrArraySize = 1;
+        rd6.MipLevels = 1; rd6.SampleDesc.Count = 1; rd6.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* r1 = NULL; ID3D12Resource* r2 = NULL;
+        dev->CreateCommittedResource(&hp6, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &rd6, D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(&r1));
+        dev->CreateCommittedResource(&hp6, D3D12_HEAP_FLAG_CREATE_NOT_ZEROED, &rd6, D3D12_RESOURCE_STATE_COMMON, NULL, IID_PPV_ARGS(&r2));
+        auto blockOf = [](ID3D12Resource* r) -> SubBlock* {
+            IUnknown* u = NULL; UINT sz = sizeof(u);
+            if (!r || FAILED(r->GetPrivateData(SUB_TRACKER_GUID, &sz, &u)) || !u) return NULL;
+            SubBlock* b = static_cast<SubTracker*>(u)->slot.block; u->Release(); return b; };
+        SubBlock* b1 = blockOf(r1); SubBlock* b2 = blockOf(r2);
+        Log("CRASH TEST 6: two pooled buffers, %s block", b1 && b1 == b2 ? "same" : "NOT the same");
+        ID3D12Device1* d1 = NULL;
+        if (b1 && SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d1))))
+        {
+            ID3D12Pageable* one[] = { r1 }; ID3D12Pageable* two[] = { r2 };
+            D3D12_RESIDENCY_PRIORITY hi = D3D12_RESIDENCY_PRIORITY_HIGH, lo = D3D12_RESIDENCY_PRIORITY_LOW;
+            HRESULT h1 = d1->SetResidencyPriority(1, one, &hi);
+            Log("CRASH TEST 6: r1 HIGH -> 0x%08lX, block 0x%08X (want HIGH 0x%08X)", (unsigned long)h1, b1->applied, (unsigned)hi);
+            HRESULT h2 = d1->SetResidencyPriority(1, two, &lo);
+            Log("CRASH TEST 6: r2 LOW -> 0x%08lX, block 0x%08X (still HIGH: r1 is high)", (unsigned long)h2, b1->applied);
+            r1->Release(); r1 = NULL;
+            Sleep(1500);   // the grower thread brings the block down
+            Log("CRASH TEST 6: r1 freed, block 0x%08X (want the rest's highest: NORMAL 0x%08X, other residents unset)", b1->applied, (unsigned)D3D12_RESIDENCY_PRIORITY_NORMAL);
+            d1->Release();
+        }
+        Log("CRASH TEST 6: device reason 0x%08lX (0 = no removal)", (unsigned long)dev->GetDeviceRemovedReason());
+        if (r2) r2->Release();
+    }
+#elif CRASH_TEST == 5
     // the game's residency calls on a resource the memory fix placed in a block: legal or a device removal?
     {
         D3D12_HEAP_PROPERTIES hp5 = {}; hp5.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -3541,6 +3784,7 @@ static void PatchDevice(ID3D12Device* dev, const char* how)
         { VT_Evict,                    (void*)h_Evict, (void**)&o_Evict, 0, "Evict" },
         { VT_GetDeviceRemovedReason,   (void*)h_GetDeviceRemovedReason, (void**)&o_GetDeviceRemovedReason, 0, "GetDeviceRemovedReason" },
         { VT_EnqueueMakeResident,      (void*)h_Enqueue, (void**)&o_Enqueue, 3, "EnqueueMakeResident" },
+        { VT_SetResidencyPriority,     (void*)h_SetResidencyPriority, (void**)&o_SetResidencyPriority, 1, "SetResidencyPriority" },
         { VT_CreateCommittedResource1, (void*)h_CCR1, (void**)&o_CCR1, 4,  "CreateCommittedResource1" },
         { VT_CreateHeap1,              (void*)h_CH1,  (void**)&o_CH1,  4,  "CreateHeap1" },
         { VT_CreateReservedResource1,  (void*)h_CRR1, (void**)&o_CRR1, 4,  "CreateReservedResource1" },
@@ -3580,7 +3824,7 @@ static HRESULT WINAPI h_D3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL f
     if (!g_devicePatched)
     {
         EnableDred();   // before the device: DRED settings apply to devices made after them
-        if (g_pt.v && g_pt.v->debugLayer && !g_ptd.on) PtEnableDebugLayer();
+        if (((g_pt.v && g_pt.v->debugLayer) || g_cfg.debugLayer) && !g_ptd.on) PtEnableDebugLayer();
     }
     HRESULT hr = o_D3D12CreateDevice(adapter, fl, riid, pp);
     if (FAILED(hr) && pp && g_ptd.on && !g_devicePatched) PoolTestDebugFailed(hr);
@@ -4254,6 +4498,8 @@ static DWORD WINAPI InitThread(LPVOID)
         g_cfg.dataReadMBs, g_cfg.raiseDirectQueue);
     Log("config: RaiseCopyQueue = %d | SuballocateGpuWrittenTextures = %d", g_cfg.raiseCopyQueue, g_cfg.subGpuTextures);
     Log("config: Probe = %d | CrashInfo = %d | [Engine] %d setting%s", g_cfg.probe, g_cfg.crashInfo, g_cfg.nEngine, g_cfg.nEngine == 1 ? "" : "s");
+    if (g_cfg.fakeVramMB || g_cfg.debugLayer)
+        Log("config: TESTING - FakeVramMB = %d | DebugLayer = %d", g_cfg.fakeVramMB, g_cfg.debugLayer);
     for (int i = 0; i < g_cfg.nEngine; ++i)
         Log("config:   %s.%s = %s", g_cfg.engine[i].cls, g_cfg.engine[i].fld, g_cfg.engine[i].val);
 #endif

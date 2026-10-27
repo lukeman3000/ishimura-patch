@@ -19,6 +19,7 @@ const int VT_MakeResident             = DEV(MakeResident);
 const int VT_Evict                    = DEV(Evict);
 const int VT_GetDeviceRemovedReason   = DEV(GetDeviceRemovedReason);
 const int VT_EnqueueMakeResident      = DEV(EnqueueMakeResident);
+const int VT_SetResidencyPriority     = DEV(SetResidencyPriority);
 const int VT_CreateCommittedResource1 = DEV(CreateCommittedResource1);
 const int VT_CreateHeap1              = DEV(CreateHeap1);
 const int VT_CreateReservedResource1  = DEV(CreateReservedResource1);
