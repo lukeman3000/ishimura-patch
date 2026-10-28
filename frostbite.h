@@ -281,6 +281,8 @@ struct SettingRef
     UINT16 off;
     BYTE  bytes[4];
     bool  enum4;        // a 4-byte enum, written as an Int32
+    bool  cap;          // a Uint32 only ever lowered to val: a game value at or under it is kept
+    UINT32 seen[4];     // cap: each object's last kept game value, logged when it changes
 };
 
 // The game's own value of every field the mod has written, recorded at the
@@ -389,6 +391,18 @@ static int ApplySetting(SettingRef& r, const char* tag)
         BYTE old[4] = {};
         if (!SafeRead(r.objs[j] + r.off, old, r.width)) return -1;
         if (!memcmp(old, r.bytes, r.width)) continue;
+        if (r.cap && r.width == 4)
+        {
+            UINT32 cur, cap;
+            memcpy(&cur, old, 4);
+            memcpy(&cap, r.bytes, 4);
+            if (cur <= cap)
+            {
+                if (cur != r.seen[j]) Log("%s: %s.%s @ %p is the game's %u - at or under %u, kept", tag, r.cls, r.fld, r.objs[j], cur, cap);
+                r.seen[j] = cur;
+                continue;
+            }
+        }
         __try { memcpy(r.objs[j] + r.off, r.bytes, r.width); }
         __except (EXCEPTION_EXECUTE_HANDLER) { Log("%s: %s.%s write FAILED @ %p", tag, r.cls, r.fld, r.objs[j]); return -1; }
         OrigRecord(r.objs[j] + r.off, old);

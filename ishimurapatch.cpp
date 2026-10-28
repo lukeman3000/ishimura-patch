@@ -130,7 +130,7 @@ struct Config
     int  crashInfo = 1;
     int  fakeVramMB = 0;   // [Advanced] FakeVramMB: testing - leave the game about this much of the card (FillVram)
     int  debugLayer = 0;   // [Advanced] DebugLayer: testing - D3D12's debug layer on, its messages in the log
-    struct { char cls[96], fld[96], val[64]; } engine[16];   // [Engine] Class.Field = value
+    struct { char cls[96], fld[96], val[64]; bool cap; } engine[16];   // [Engine] Class.Field = value (cap: only ever lowered)
     int  nEngine = 0;
 };
 static Config g_cfg;
@@ -320,6 +320,12 @@ static const char* DEFAULT_INI =
 "; slightly lower-detail version for a few frames until the sharp one is\n"
 "; in. With [Fix] on this takes the lift test's worst frame ~18 -> ~12 ms.\n"
 "TextureStreamingSettings.ForceLoadStreamingImmediate = 0\n"
+";\n"
+"; PoolSize: the game's texture pool, sized from the card it detects. With\n"
+"; [Fix] on, the mod lowers it on cards with less than about 10 GB, so the\n"
+"; game doesn't slow to a crawl at the memory limit (logged as TEXTURE POOL).\n"
+"; A PoolSize line here replaces that with your own value.\n"
+"; TextureStreamingSettings.PoolSize = 1800000\n"
 "\n"
 "\n"
 "[Advanced]\n"
@@ -424,6 +430,7 @@ static void ReadConfig(Config& c, const Config& fb)
         strcpy_s(e.cls, sizeof(e.cls), STREAMING_CLS);
         STREAMING_FLD.Get(e.fld);
         strcpy_s(e.val, sizeof(e.val), "0");
+        e.cap = false;
     }
 #else
     {
@@ -443,6 +450,7 @@ static void ReadConfig(Config& c, const Config& fb)
             *dot = 0;
             strncpy_s(e.cls, sizeof(e.cls), key, _TRUNCATE);
             strncpy_s(e.fld, sizeof(e.fld), dot + 1, _TRUNCATE);
+            e.cap = false;
             c.nEngine++;
         }
     }
@@ -2587,10 +2595,50 @@ static bool SameSetting(const SettingRef& r, const char* cls, const char* fld)
     return !strcmp(r.cls, cls) && !strcmp(r.fld, fld);
 }
 
+// The texture pool on small cards. The game sizes its texture pool
+// (TextureStreamingSettings.PoolSize) from the card it detects: 3000000 on a
+// 24 GB 4090. Near the memory budget the pools' blocks are held resident and
+// the game drops to a slideshow; with ~6 GB left, 1800000 cured it (10/27,
+// bench/lowmem-tuning.md R4: fewer hitches than the base game in the same
+// squeeze). So with [Fix] on and no PoolSize line in [Engine], the pool is
+// capped at 300 per MB of the card's budget (FakeVramMB when testing), R4's
+// ratio: only ever lowered, so cards over ~10 GB keep the game's value.
+static const char  POOL_CLS[] = "TextureStreamingSettings", POOL_FLD[] = "PoolSize";
+static const int   POOL_PER_MB = 300;
+static volatile LONG g_autoPool = 0;
+
+// The cap, or 0 until the card's numbers are in (the adapter opens about a
+// second after the game makes its device).
+static int AutoPoolSize()
+{
+    if (g_autoPool) return g_autoPool;
+    int mb = g_cfg.fakeVramMB;
+    DXGI_QUERY_VIDEO_MEMORY_INFO m = {};
+    if (mb <= 0)
+    {
+        if (!g_adapter || !MemoryInfo(true, m)) return 0;
+        mb = (int)(m.Budget >> 20);
+    }
+    if (mb <= 0) return 0;
+    if (!InterlockedCompareExchange(&g_autoPool, mb * POOL_PER_MB, 0))
+        Log("TEXTURE POOL: %d MB of card memory%s - the game's %s.%s capped at %d", mb,
+            g_cfg.fakeVramMB > 0 ? " (FakeVramMB)" : " (budget)", POOL_CLS, POOL_FLD, mb * POOL_PER_MB);
+    return g_autoPool;
+}
+
+// Whether the cap applies to this [Engine] list: [Fix] on and no PoolSize line.
+static bool AutoPoolWanted(const decltype(g_cfg.engine)& list, int n)
+{
+    if (!g_cfg.suballocate) return false;
+    for (int i = 0; i < n; ++i) if (!strcmp(list[i].cls, POOL_CLS) && !strcmp(list[i].fld, POOL_FLD)) return false;
+    return n < 16;
+}
+
 static DWORD WINAPI EngineThread(LPVOID)
 {
     static EngineSlot slots[16], next[16];
     int n = 0;
+    bool poolPending = false;   // the cap is wanted but the card's numbers aren't in yet
     for (int w = 0; w < 600 && !DeviceReady(); ++w) Sleep(100);
     Sleep(5000);
     ImgInit();
@@ -2604,6 +2652,19 @@ static DWORD WINAPI EngineThread(LPVOID)
             int nw = g_cfg.nEngine;
             memcpy(want, g_cfg.engine, sizeof(want));
             LeaveCriticalSection(&g_engineCs.cs);
+            poolPending = false;
+            if (AutoPoolWanted(want, nw))
+            {
+                if (int cap = AutoPoolSize())
+                {
+                    auto& e = want[nw++];
+                    strcpy_s(e.cls, sizeof(e.cls), POOL_CLS);
+                    strcpy_s(e.fld, sizeof(e.fld), POOL_FLD);
+                    _snprintf_s(e.val, sizeof(e.val), _TRUNCATE, "%d", cap);
+                    e.cap = true;
+                }
+                else poolPending = true;
+            }
             bool taken[16] = {};
             int nn = 0;
             for (int i = 0; i < nw; ++i)
@@ -2616,6 +2677,7 @@ static DWORD WINAPI EngineThread(LPVOID)
                     // kept: a new value is written at once; objects and originals stay
                     taken[j] = true;
                     s = slots[j];
+                    s.r.cap = want[i].cap;
                     if (strcmp(s.r.val, want[i].val))
                     {
                         strncpy_s(s.r.val, sizeof(s.r.val), want[i].val, _TRUNCATE);
@@ -2629,6 +2691,7 @@ static DWORD WINAPI EngineThread(LPVOID)
                 strncpy_s(s.r.cls, sizeof(s.r.cls), want[i].cls, _TRUNCATE);
                 strncpy_s(s.r.fld, sizeof(s.r.fld), want[i].fld, _TRUNCATE);
                 strncpy_s(s.r.val, sizeof(s.r.val), want[i].val, _TRUNCATE);
+                s.r.cap = want[i].cap;
                 s.addedTick = tick;
                 if (tick) Log2("ENGINE: %s.%s = %s added (live)", s.r.cls, s.r.fld, s.r.val);
             }
@@ -2643,6 +2706,7 @@ static DWORD WINAPI EngineThread(LPVOID)
             memcpy(slots, next, sizeof(slots));
             n = nn;
         }
+        if (poolPending && AutoPoolSize()) InterlockedExchange(&g_engineDirty, 1);   // added next tick
         for (int i = 0; i < n; ++i)
         {
             EngineSlot& s = slots[i];
@@ -2655,7 +2719,7 @@ static DWORD WINAPI EngineThread(LPVOID)
                 if (ResolveSetting(s.r, "ENGINE", !last))
                 {
                     s.resolved = true;
-                    if (ApplySetting(s.r, "ENGINE: set") == 0) Log("ENGINE: %s.%s already %s", s.r.cls, s.r.fld, s.r.val);
+                    if (ApplySetting(s.r, "ENGINE: set") == 0 && !s.r.cap) Log("ENGINE: %s.%s already %s", s.r.cls, s.r.fld, s.r.val);
                 }
                 else if (last || !s.r.width)   // !width: no such class, field or writable type
                 {
@@ -2698,6 +2762,14 @@ static DWORD WINAPI EarlyEngineThread(LPVOID)
         strncpy_s(refs[i].fld, sizeof(refs[i].fld), g_cfg.engine[i].fld, _TRUNCATE);
         strncpy_s(refs[i].val, sizeof(refs[i].val), g_cfg.engine[i].val, _TRUNCATE);
     }
+    if (AutoPoolWanted(g_cfg.engine, n))
+    {
+        // the texture pool cap: its value comes once the card's numbers are in
+        refs[n] = SettingRef();
+        strcpy_s(refs[n].cls, sizeof(refs[n].cls), POOL_CLS);
+        strcpy_s(refs[n].fld, sizeof(refs[n].fld), POOL_FLD);
+        refs[n++].cap = true;
+    }
     ImgInit();
     LONGLONG t0 = Now(), until = t0 + g_qpcFreq * 60;
     int rewrites[16] = {}, scans[16] = {};
@@ -2708,6 +2780,12 @@ static DWORD WINAPI EarlyEngineThread(LPVOID)
         for (int i = 0; i < n; ++i)
         {
             if (failed[i]) continue;
+            if (refs[i].cap && !refs[i].val[0])
+            {
+                int cap = AutoPoolSize();
+                if (!cap) continue;
+                _snprintf_s(refs[i].val, sizeof(refs[i].val), _TRUNCATE, "%d", cap);
+            }
             if (!found[i])
             {
                 searching = true;
@@ -4586,7 +4664,7 @@ static DWORD WINAPI InitThread(LPVOID)
     Log("--- ishimurapatch init done ---");
 
     HANDLE t;
-    if (g_cfg.nEngine && (t = CreateThread(NULL, 0, EarlyEngineThread, NULL, 0, NULL))) CloseHandle(t);
+    if ((g_cfg.nEngine || g_cfg.suballocate) && (t = CreateThread(NULL, 0, EarlyEngineThread, NULL, 0, NULL))) CloseHandle(t);
     if ((t = CreateThread(NULL, 0, FallbackThread, NULL, 0, NULL))) CloseHandle(t);
     if ((t = CreateThread(NULL, 0, QueueStatsThread, NULL, 0, NULL))) CloseHandle(t);
     if (o_NtReadFile && (t = CreateThread(NULL, 0, ThrottleThread, NULL, 0, NULL))) CloseHandle(t);
