@@ -322,7 +322,7 @@ static const char* DEFAULT_INI =
 "TextureStreamingSettings.ForceLoadStreamingImmediate = 0\n"
 ";\n"
 "; PoolSize: the game's texture pool, sized from the card it detects. With\n"
-"; [Fix] on, the mod lowers it on cards with less than about 10 GB, so the\n"
+"; [Fix] on, the mod lowers it on cards with less than about 8 GB, so the\n"
 "; game doesn't slow to a crawl at the memory limit (logged as TEXTURE POOL).\n"
 "; A PoolSize line here replaces that with your own value.\n"
 "; TextureStreamingSettings.PoolSize = 1800000\n"
@@ -2601,11 +2601,19 @@ static bool SameSetting(const SettingRef& r, const char* cls, const char* fld)
 // the game drops to a slideshow; with ~6 GB left, 1800000 cured it (10/27,
 // bench/lowmem-tuning.md R4: fewer hitches than the base game in the same
 // squeeze). So with [Fix] on and no PoolSize line in [Engine], the pool is
-// capped at 300 per MB of the card's budget (FakeVramMB when testing), R4's
-// ratio: only ever lowered, so cards over ~10 GB keep the game's value.
+// capped by the card's budget (FakeVramMB when testing): 300 per MB up to
+// 6 GB (R4's ratio), then rising to 3000000 at 8 GB, where the game's own
+// value passed (S8a; 2100000 at 6 GB played no better than 1800000, blind
+// A/B 10/28). Only ever lowered, so cards over ~8 GB keep the game's value.
 static const char  POOL_CLS[] = "TextureStreamingSettings", POOL_FLD[] = "PoolSize";
-static const int   POOL_PER_MB = 300;
+static const int   POOL_LOW_MB = 6000, POOL_LOW = 1800000, POOL_HIGH_MB = 8000, POOL_HIGH = 3000000;
 static volatile LONG g_autoPool = 0;
+
+static int PoolCap(int mb)
+{
+    if (mb <= POOL_LOW_MB) return mb * (POOL_LOW / POOL_LOW_MB);
+    return POOL_LOW + (int)((long long)(mb - POOL_LOW_MB) * (POOL_HIGH - POOL_LOW) / (POOL_HIGH_MB - POOL_LOW_MB));
+}
 
 // The cap, or 0 until the card's numbers are in (the adapter opens about a
 // second after the game makes its device).
@@ -2620,9 +2628,9 @@ static int AutoPoolSize()
         mb = (int)(m.Budget >> 20);
     }
     if (mb <= 0) return 0;
-    if (!InterlockedCompareExchange(&g_autoPool, mb * POOL_PER_MB, 0))
+    if (!InterlockedCompareExchange(&g_autoPool, PoolCap(mb), 0))
         Log("TEXTURE POOL: %d MB of card memory%s - the game's %s.%s capped at %d", mb,
-            g_cfg.fakeVramMB > 0 ? " (FakeVramMB)" : " (budget)", POOL_CLS, POOL_FLD, mb * POOL_PER_MB);
+            g_cfg.fakeVramMB > 0 ? " (FakeVramMB)" : " (budget)", POOL_CLS, POOL_FLD, PoolCap(mb));
     return g_autoPool;
 }
 
